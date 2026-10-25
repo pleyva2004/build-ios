@@ -52,6 +52,21 @@ claude --model haiku                             # then: /ui add a settings scre
 cd ../MyAppSwiftUI && ./run.sh
 ```
 
+## Designing by prompt
+The skill is built for a designer who only talks to Claude, with no commands or code. Scaffolded apps
+ship [DESIGNER.md](templates/DESIGNER.md), a plain-language guide. Three things cut the rounds it takes
+to reach the design they imagine:
+- **Options for feelings:** "make it calmer", "feel like an achievement" or "show me ideas" returns 3
+  clearly different directions in one Claude turn (~5–6 s). Saying "next" or "option 2" flips between
+  them instantly.
+- **Instant words:** undo, redo, next, previous, option N, keep and select are answered in ~0.4 s by the
+  prompt hook, with no model call.
+- **Taste memory:** "from now on…" or "never…" goes into a brief in `design/app.json` that heads every
+  prompt, so later changes and options fit it.
+
+Measured on a real prototype with a 15-prompt session: 9 of 15 prompts were instant, and a Claude turn
+took a 5.2 s median on Haiku.
+
 ## Layout
 ```
 build-ios/

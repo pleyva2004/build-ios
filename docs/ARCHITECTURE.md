@@ -131,6 +131,31 @@ Prototyping speed comes from the UI being data. Shipping usually wants code a de
 - **Re-ejecting:** a manifest of file hashes means re-ejecting never overwrites hand edits.
 - **CI:** CI builds the ejected demo app and compares its screenshots with the prototype's.
 
+### 10. Fewer rounds for a designer who only prompts
+Latency per change is only half the loop. For a non-technical designer the cost is the number of rounds
+between what they imagine and what appears, so the loop is shaped around how a designer talks:
+- **Options instead of guesses:** an apply envelope can carry `"options"`. Each one is validated
+  against the current design, the first is shown, and the rest wait. A feeling or open-ended prompt
+  gets a one-line hint in the context, so the fast model reliably sends 3 options. Another hint
+  flags lasting preferences.
+- **Instant words:** the `UserPromptSubmit` hook answers short words itself and stops the turn with
+  `continue: false`, at about 0.4 s and no model call:
+  - undo and redo (a redo stack is cleared by any new change);
+  - next, previous, option N and keep;
+  - select, which starts tap-to-pick.
+- **Taste memory:** `app.json` `"brief"` is a list of the designer's lasting preferences. It heads the
+  context, and every change and option must fit it. The cookbook that maps designer words to design
+  moves ("calmer", "premium", "trustworthy"…) defers to it.
+- **Telemetry:** `./ui stats` reports rounds: prompts to Claude vs instant, undo rate and options kept.
+
+Measured with a scripted 15-prompt designer session in headless Claude Code against the firstApp
+prototype (one open chat, stand-in app):
+- 9 of 15 prompts were instant (0.27–0.55 s).
+- Options turns took 5–6.5 s and single changes 4–6 s.
+- The whole session cost $0.012 on Haiku and $0.22 on Sonnet, at about the same speed.
+- The first run exposed five fixes, applied above: the feeling hint, instant replies when no options
+  are on screen, thinking off, full copy in the context, and the brief winning over the cookbook.
+
 ## Latency budget (measure your own with `./ui stats`)
 "Measured" rows come from headless Claude Code 2.1 runs on Haiku against a scaffolded app;
 the CLI startup of a fresh `claude -p` process (~2–3 s) is not included in the in-session numbers.
@@ -138,6 +163,8 @@ the CLI startup of a fresh `claude -p` process (~2–3 s) is not included in the
 | Path | Model | Write + validate | App confirms | Total |
 |---|---|---|---|---|
 | `./ui tune` key (no model) | — | ~30 ms | ≤150 ms | **~0.2 s** |
+| instant word in chat (next, keep, undo…) | — | hook | ≤150 ms | **0.3–0.5 s measured** |
+| feeling prompt → 3 options (Haiku, open chat) | ~5 s | ~30 ms | ≤150 ms | **5–9.6 s measured** |
 | `./ui apply` (ops given) | — | ~30 ms | ≤150 ms | **~0.2 s** (0.25 s + 0.22 s in CI) |
 | `/ui` in Claude Code (Haiku) | ~2 s | ~30 ms | ≤150 ms | **3.0 s measured** (2 turns, ~$0.004) |
 | plain prompt, `claude --model haiku` session | ~2.5 s | ~30 ms | ≤150 ms | **3.2 s measured** |
