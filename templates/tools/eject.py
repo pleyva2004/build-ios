@@ -1446,9 +1446,6 @@ class ScreenGen:
         symbol = self.text(p.get("symbol"), scope)
         if symbol is not None:
             lines = [pad + f"Image(systemName: {symbol.swift})"]
-            size = self.number(p.get("size"))
-            if size:
-                lines.append(pad + f".font(.system(size: {size.expr}))")
             mode = rt_string(p.get("symbolMode"))
             if mode in ("hierarchical", "multicolor", "monochrome"):
                 lines.append(pad + f".symbolRenderingMode(.{mode})")
@@ -1695,10 +1692,6 @@ class ScreenGen:
         mods = []
         size, weight, design, style = self.ej.font_spec(p)
         font = self.ej.font_expr(size, weight, design, style)
-        if font and t == "image" and p.get("symbol") is not None:
-            own = self.number(p.get("size"))
-            if own and font == f"Font.system(size: {num(min(max(own.value, 1), 400))})":
-                font = None  # the symbol already got exactly this font in content()
         if font:
             tok = rt_string(p.get("font"))
             own = any(p.get(k) is not None for k in ("size", "weight", "design"))

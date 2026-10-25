@@ -321,10 +321,8 @@ extension LiveNodeView {
 
     func image(_ p: JSONObject, _ theme: LiveTheme) -> AnyView {
         if let symbol = theme.text(p["symbol"]) {
+            // size / weight / design come from textModifiers (theme.font), so they combine.
             var view = AnyView(Image(systemName: symbol))
-            if let size = theme.number(p["size"]) {
-                view = AnyView(view.font(.system(size: size)))
-            }
             switch theme.text(p["symbolMode"]) {
             case "hierarchical": view = AnyView(view.symbolRenderingMode(.hierarchical))
             case "multicolor": view = AnyView(view.symbolRenderingMode(.multicolor))

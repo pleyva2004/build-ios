@@ -189,8 +189,8 @@ class OutputTest(EjectCase):
         self.run_eject()
         s = self.screen("Explore")
         self.assertIn("Image(systemName: item.symbol)", s)
-        self.assertIn(".font(.system(size: 28))", s)
-        self.assertNotIn(".font(Font.system(size: 28))", s)  # no duplicate of the symbol size
+        self.assertIn(".font(Font.system(size: 28))", s)
+        self.assertEqual(s.count("size: 28"), 1)  # one font, so weight/design can combine with the size
         self.assertIn(".background(Theme.color(item.color) ?? Color.clear)", s)
         self.assertIn("count: 2), spacing: Theme.Spacing.md) {", s)
         self.assertIn('TextField("Search topics", text: $state.query)', s)
@@ -313,6 +313,11 @@ class TranslationTest(EjectCase):
         self.assertIn('Text(verbatim: "50% *off*")', s)
         self.assertIn('Text("Plain words")', s)
         self.assertIn('Toggle("a_b" as String, isOn: $state.ab)', s)
+
+    def test_symbol_size_and_weight_combine(self):
+        s = self.body({"type": "vstack", "id": "home.root", "children": [
+            {"type": "image", "id": "home.icon", "symbol": "star", "size": 16, "weight": "semibold"}]})
+        self.assertIn(".font(Font.system(size: 16, weight: .semibold))", s)
 
     def test_emails_and_urls_are_not_turned_into_links(self):
         s = self.body({"type": "vstack", "id": "home.root", "children": [
