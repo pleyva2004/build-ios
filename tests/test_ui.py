@@ -228,7 +228,7 @@ class NudgeOpTest(ProjectCase):
         self.assertEqual(self.nudge("home.story.image", "radius")["radius"], "$lg")
 
     def test_weight(self):
-        self.assertEqual(self.nudge("home.section", "weight")["weight"], "semibold")  # $headline is semibold
+        self.assertEqual(self.nudge("home.section", "weight")["weight"], "bold")  # $headline is semibold
         self.assertEqual(self.nudge("profile.email", "weight")["weight"], "semibold")  # $caption is medium
         self.assertEqual(self.nudge("compose.hint", "weight", -1)["weight"], "regular")
 
@@ -542,6 +542,24 @@ class FixerTest(ProjectCase):
         n, _ = self.insert({"type": "text", "text": "x", "lines": "2"})
         self.assertEqual(n["lines"], 2)
 
+    def test_cookbook_center_text_keeps_infinity(self):
+        r = self.apply({"op": "set", "id": "home.hero.subtitle",
+                        "props": {"maxWidth": "infinity", "frameAlign": "center", "textAlign": "center"}})
+        n = self.node("home.hero.subtitle")
+        self.assertEqual((n["maxWidth"], n["frameAlign"], n["textAlign"]), ("infinity", "center", "center"))
+        self.assertEqual(r["notes"], [])
+        self.assertNotIn("Infinity", (self.root / "design" / "screens" / "home.json").read_text())
+
+    def test_button_on_tap_becomes_action(self):
+        # Swift runs only "action" on a button (its onTap is ignored there)
+        r = self.apply({"op": "set", "id": "story.save", "props": {"onTap": {"dismiss": True}}})
+        n = self.node("story.save")
+        self.assertEqual(n["action"], {"dismiss": True})
+        self.assertNotIn("onTap", n)
+        self.assertIn("story.save: onTap→action", r["notes"])
+        n, _ = self.insert({"type": "text", "text": "x", "action": {"dismiss": True}})
+        self.assertEqual(n["onTap"], {"dismiss": True})  # and the reverse on non-buttons
+
     def test_enum_case(self):
         n, _ = self.insert({"type": "button", "text": "Go", "variant": "Primary", "controlSize": "LARGE"})
         self.assertEqual((n["variant"], n["controlSize"]), ("primary", "large"))
@@ -619,7 +637,7 @@ class ValidatorTest(ProjectCase):
 
     def test_missing_token_did_you_mean(self):
         self.assertError(self.set_prop("home.section", "foreground", "$brnd"), "no color token '$brnd'",
-                         "Did you mean brand?")
+                         "Did you mean brand", 'Add it with {"op":"token","path":"colors.brnd"')
         self.assertError(self.set_prop("home.section", "padding", "$mdd"), "no spacing/radius token '$mdd'",
                          "Did you mean md")
         self.assertError(self.set_prop("home.section", "font", "$titel"), "no font token '$titel'",
@@ -690,6 +708,16 @@ class ValidatorTest(ProjectCase):
         (self.root / "design" / "screens" / "story.json").write_text("{ nope", encoding="utf-8")
         v = self.run_validator()
         self.assertTrue(any("screens/story.json: invalid JSON" in e for e in v.errors), v.errors)
+        before = self.design_bytes()
+        with self.assertRaises(ui.UIError) as cm:
+            self.apply({"op": "set", "id": "home.section", "props": {"text": "x"}})
+        self.assertIn("design files are broken", str(cm.exception))
+        self.assertEqual(self.design_bytes(), before)
+
+    def test_hidden_screen_files_are_ignored(self):
+        (self.root / "design" / "screens" / ".draft.json").write_text("{ half-written", encoding="utf-8")
+        self.assertEqual(self.run_validator().errors, [])
+        self.assertNotIn("", self.design().screens)
 
     def test_warnings(self):
         v = self.run_validator(self.set_prop("compose.hint", "frameAlign", "center"))
@@ -1241,6 +1269,8 @@ class HookTest(ProjectCase):
         self.assertIn('"Latest" → home.section', out)
         with mock.patch.dict(os.environ, {"UI_NO_CONTEXT_HOOK": "1"}):
             self.assertEqual(self.hook({"hook_event_name": "UserPromptSubmit", "prompt": "x"})[1], "")
+        # slash commands (/ui) inject their own context
+        self.assertEqual(self.hook({"hook_event_name": "UserPromptSubmit", "prompt": " /ui make it blue"})[1], "")
 
     def test_pre_tool_use_allows_inert_ui_commands(self):
         allowed = [

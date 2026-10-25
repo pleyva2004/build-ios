@@ -1004,35 +1004,33 @@ def extract_json(text: str):
             return json.loads(fence.group(1))
         except json.JSONDecodeError:
             pass
-    pairs = sorted((("{", "}"), ("[", "]")), key=lambda oc: (text.find(oc[0]) == -1, text.find(oc[0])))
-    for opener, closer in pairs:
-        start = text.find(opener)
-        while start != -1:
-            depth = 0
-            in_str = False
-            esc = False
-            for i in range(start, len(text)):
-                ch = text[i]
-                if in_str:
-                    if esc:
-                        esc = False
-                    elif ch == "\\":
-                        esc = True
-                    elif ch == '"':
-                        in_str = False
-                    continue
-                if ch == '"':
-                    in_str = True
-                elif ch == opener:
-                    depth += 1
-                elif ch == closer:
-                    depth -= 1
-                    if depth == 0:
-                        try:
-                            return json.loads(text[start:i + 1])
-                        except json.JSONDecodeError:
-                            break
-            start = text.find(opener, start + 1)
+    # Try every "{" / "[" in text order: "Change [1 of 1]: {...}" must yield the object.
+    for start, opener in [(i, c) for i, c in enumerate(text) if c in "{["]:
+        closer = "}" if opener == "{" else "]"
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        break
     return None
 
 
@@ -2174,8 +2172,9 @@ VARIANT_DIRECTIONS = [
 
 
 def request_ops(project: Project, backend: Backend, context: str, system: str, request: str,
-                retries: int = 1):
-    """One model round trip (plus one corrective retry): returns (ops, say, model_seconds)."""
+                retries: int = 1, base=None):
+    """One model round trip (plus one corrective retry): returns (ops, say, model_seconds).
+    `base` (design texts) validates against that design instead of the files on disk."""
     t0 = time.time()
     if not context:
         context = build_context(project, request=request)
@@ -2188,7 +2187,7 @@ def request_ops(project: Project, backend: Backend, context: str, system: str, r
             if not isinstance(data, (dict, list)):
                 raise UIError("reply was not JSON")
             ops = parse_ops(data)
-            dry_run(project, ops)
+            dry_run(project, ops, base)
             say = data.get("say", "") if isinstance(data, dict) else ""
             return ops, say, time.time() - t0
         except UIError as e:
@@ -2228,10 +2227,12 @@ def ask_variants(project: Project, backend: Backend, context: str, system: str, 
     the rest are staged for ./ui next as they arrive."""
     n = max(2, min(n, len(VARIANT_DIRECTIONS)))
     t0 = time.time()
+    # Every variant applies to the design as it is now, even after the first one is on screen.
+    base = Design(project).snapshot_texts()
 
     def one(i: int):
         hint = f"{request}\n\nDesign direction for this variant: {VARIANT_DIRECTIONS[i]}. Make it clearly distinct."
-        ops, say, secs = request_ops(project, backend, context, system, hint)
+        ops, say, secs = request_ops(project, backend, context, system, hint, base=base)
         return {"name": say or VARIANT_DIRECTIONS[i].split(":")[0], "ops": ops, "seconds": round(secs, 2)}
 
     got = []
@@ -2286,8 +2287,11 @@ def print_result_short(project: Project, r: dict, model_s: float) -> None:
         print(f"    screenshot: {r['shot']}")
 
 
-def dry_run(project: Project, ops: list) -> None:
+def dry_run(project: Project, ops: list, base=None) -> None:
     design = Design(project)
+    if base is not None:
+        design.load_texts(base)
+        design.load_errors = []  # the disk state doesn't matter here
     Applier(design).apply_all(ops)
     v = Validator(design).run()
     if v.errors:
@@ -2613,7 +2617,8 @@ def inert_ui_command(cmd: str) -> bool:
     """True for `./ui <cmd> [simple args]` optionally followed by a quoted heredoc whose
     body (inert data: quoted heredocs are not expanded) ends at the very last line."""
     lines = cmd.rstrip("\n").split("\n")
-    m = HEREDOC_FIRST.match(lines[0].strip())
+    # only bash's own blanks: \r, \v, \f would stay in the delimiter word ('OPS'\r ends at "OPS\r")
+    m = HEREDOC_FIRST.match(lines[0].strip(" \t"))
     if not m:
         return False
     delim = m.group(3)
@@ -2899,7 +2904,7 @@ def cmd_eval(project: Project, args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ui", description="Live UI engine: edit design/*.json fast and safely.",
-                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n\n")[1])
+                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog="\n\n".join(__doc__.split("\n\n")[1:3]))
     sub = p.add_subparsers(dest="cmd")
 
     s = sub.add_parser("context", help="compact map of the current screen for a model")
