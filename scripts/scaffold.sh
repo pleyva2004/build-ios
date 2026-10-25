@@ -38,7 +38,7 @@ cp "$TPL"/Components/*.swift "$DEST/Sources/Components/"
 cp -R "$TPL/design" "$DEST/design"
 subst "$TPL/design/app.json" > "$DEST/design/app.json"
 cp "$TPL/ui" "$DEST/ui"
-cp "$TPL/tools/REFERENCE.md" "$TPL/tools/evals.jsonl" "$DEST/tools/"
+cp "$TPL/tools/REFERENCE.md" "$TPL/tools/evals.jsonl" "$TPL/tools/eject.py" "$DEST/tools/"
 subst "$TPL/run.sh" > "$DEST/run.sh"
 chmod +x "$DEST/run.sh" "$DEST/ui"
 

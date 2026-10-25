@@ -3,3 +3,4 @@
 build/
 .live/
 *.xcodeproj/
+__pycache__/
