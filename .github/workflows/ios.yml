@@ -5,12 +5,20 @@ name: live-ui template
 # app confirms the new revision -> before/after screenshots (uploaded as artifacts).
 on:
   workflow_dispatch:
+    inputs:
+      commit_screenshots:
+        description: "Commit the screenshots to docs/screenshots on this branch"
+        type: boolean
+        default: false
   push:
     paths:
       - "templates/**"
       - "scripts/**"
       - "tests/**"
       - ".github/workflows/ios.yml"
+
+permissions:
+  contents: write   # only used by the opt-in "commit screenshots" step
 
 jobs:
   unit:
@@ -97,12 +105,21 @@ jobs:
           sleep 1
           t 60 xcrun simctl io "$UDID" screenshot .live/3-after-undo.png || echo "screenshot timed out"
 
+          # 4) other tabs, reached through hot reload alone (keep one tab -> the app selects it)
+          for tab in explore profile; do
+            ./ui apply "{\"op\":\"path\",\"file\":\"app\",\"path\":\"tabs\",\"value\":[{\"id\":\"$tab\",\"title\":\"$tab\",\"symbol\":\"circle\",\"screen\":\"$tab\"}]}"
+            sleep 3
+            t 60 xcrun simctl io "$UDID" screenshot ".live/4-$tab.png" || echo "screenshot timed out"
+            ./ui undo
+          done
+          [ "$(cat design/*.json design/screens/*.json | shasum)" = "$BEFORE" ] || { echo "undo did not restore design/"; exit 1; }
+
           python3 - <<'PY'
           import json, sys
           s = json.load(open(".live/status.json"))
           print(s)
           assert s.get("source") in ("env", "defaults", "source"), "app is not live: %s" % s.get("source")
-          assert s.get("rev", 0) >= 2, "app did not confirm the revisions"
+          assert s.get("rev", 0) >= 6, "app did not confirm the revisions"
           assert not s.get("error"), s.get("error")
           PY
           ./ui status
@@ -119,6 +136,21 @@ jobs:
             base64 -i "${f%.png}.small.jpg" | fold -w 900
             echo "IMG_END"
           done
+
+      - name: Commit screenshots to docs/screenshots (manual runs only)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_screenshots }}
+        run: |
+          mkdir -p docs/screenshots
+          cp "$RUNNER_TEMP/Demo/.live/1-launch.png" docs/screenshots/home.png
+          cp "$RUNNER_TEMP/Demo/.live/2-after-apply.png" docs/screenshots/home-after-apply.png
+          cp "$RUNNER_TEMP/Demo/.live/4-explore.png" docs/screenshots/explore.png
+          cp "$RUNNER_TEMP/Demo/.live/4-profile.png" docs/screenshots/profile.png
+          for f in docs/screenshots/*.png; do sips -Z 900 "$f" >/dev/null; done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/screenshots
+          git commit -m "docs: Simulator screenshots from CI [skip ci]" || exit 0
+          git push origin "HEAD:${GITHUB_REF_NAME}"
 
       - name: Upload screenshots and logs
         if: always()
