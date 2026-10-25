@@ -1,67 +1,67 @@
 ---
 name: build-ios
-description: Scaffold, build, run, and screenshot iOS (SwiftUI) apps entirely from the command line on this Mac — no Xcode GUI required. Use whenever the user wants to create a new iOS/SwiftUI app, build or run an iOS app on the Simulator, check whether the machine is ready for iOS development, or take a Simulator screenshot. Trigger phrases include "/build-ios", "build an iOS app", "make a SwiftUI app", "run it on the simulator", "scaffold an iPhone app", "is my Mac ready for iOS dev".
+description: Scaffold, run, and iterate on iOS (SwiftUI) UI prototypes from the command line on this Mac, with sub-second hot reload of UI changes and no Xcode GUI. Use whenever the user wants to create a new iOS/SwiftUI app or demo, change the UI of one, run it on the Simulator, take a Simulator screenshot, or check whether the Mac is ready for iOS development. Trigger phrases include "/build-ios", "build an iOS app", "make a SwiftUI app", "prototype an app", "change the UI", "run it on the simulator", "is my Mac ready for iOS dev".
 ---
 
 # build-ios
 
-> Command-line iOS development harness. Everything needed to go from nothing to a
-> running app on the iOS Simulator without opening Xcode — built and verified on
-> Apple Silicon (Xcode 26.x / iOS 26.x), portable to future versions.
+> Command-line iOS UI prototyping. Scaffolded apps render their UI from JSON
+> (`design/*.json`). The app in the Simulator hot-reloads it in ~0.2 s, so a UI
+> change is one small edit: no codebase reading, no rebuild, and small fast
+> models can do it. Built for Apple Silicon, Xcode 26+, iOS 26+.
 
-## When to use
-- Create a new SwiftUI app from a clean, reproducible template.
-- Build / run / screenshot an existing app on the iOS Simulator from the terminal.
-- Diagnose whether the Mac is set up for iOS development (and get the exact fix commands).
+## The loop (read this first)
+1. **Preflight** (once per Mac): `bash scripts/doctor.sh`. Fix any `FAIL` with the printed command.
+2. **Scaffold**: `bash scripts/scaffold.sh <AppName> [parent-dir] [bundle-prefix]`
+3. **Launch once**: `cd <app> && ./run.sh` builds, boots the Simulator, launches and writes `.live/shot.png`.
+4. **Iterate with no rebuild.** Inside the app folder, every UI change is ONE call:
+   ```
+   ./ui apply <<'OPS'
+   {"say": "what changes", "ops": [{"op": "set", "id": "home.hero.title", "props": {"size": 28}}]}
+   OPS
+   ```
+   It validates, writes atomically, waits until the running app confirms the new
+   revision (~0.2 s), and prints what changed. `./ui undo` reverts.
 
-## How it works (3 building blocks)
+**Never explore the app's code to make a UI change.** Get the whole picture with
+`./ui context`: the current screen's element tree with ids, design tokens, the
+element the user picked, and recent edits. The app's own `CLAUDE.md` holds the
+ops reference (`tools/REFERENCE.md`).
 
-### 1. Preflight — is the machine ready?
-Always run the doctor first; it prints `OK` / `WARN` / `FAIL` with the exact fix command for anything missing (Xcode toolchain, iOS SDK, Simulator runtime, Homebrew tooling):
-```bash
-bash scripts/doctor.sh
-```
-If a `FAIL` line appears, run its suggested fix, then re-run the doctor. The common gaps and fixes:
-- **Xcode not installed** → `xcodes install --latest` (needs the user's Apple ID; this is interactive — have the **user** run it).
-- **Toolchain points at CommandLineTools** → `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer && sudo xcodebuild -license accept` (needs the user's password — user runs it).
-- **No Simulator runtime** → `xcodebuild -downloadPlatform iOS` (~8.5 GB; run in the background).
+## Which path?
+| The change | Path | Typical latency |
+|---|---|---|
+| Colors, copy, spacing, sizes, layout, new screens, navigation, demo data | **Fast path**: `./ui apply` (or `/ui`, `./ui ask`) | ~1–3 s with a small model; ~0.2 s to render |
+| Something JSON can't express (maps, charts, gestures, custom drawing/animation) | **Compile path**: add `Sources/Components/<Name>.swift`, register it in `LiveComponents.registry` + `catalog`, `./run.sh`, then place it with a `custom` node | one incremental build (~10–20 s) |
+| Changes to `Sources/Runtime/` | Only to fix a runtime bug, never for UI work | rebuild |
 
-### 2. Scaffold — create a new app
-```bash
-bash scripts/scaffold.sh <AppName> [parent-dir] [bundle-prefix]
-# e.g.  bash scripts/scaffold.sh Notes ~/Code com.pablo
-```
-Produces a self-contained project: `project.yml` (XcodeGen spec — the source of truth), `Sources/<AppName>App.swift` + `Sources/ContentView.swift`, a bundled `run.sh`, and a generated `<AppName>.xcodeproj`. Non-alphanumerics in the name are stripped for the scheme/bundle id.
+`./ui ask` exits with code 3 (`ESCALATE: …`) when a request needs the compile path.
 
-### 3. Build + run + screenshot
-From inside a scaffolded app folder:
-```bash
-./run.sh                 # auto-picks a simulator (prefers iPhone 17 Pro)
-./run.sh "iPhone Air"    # or name any installed simulator
-```
-`run.sh` regenerates the project, builds for the generic iOS Simulator destination (piped through `xcbeautify`), boots the simulator, installs + launches the app, and writes `<AppName>-screenshot.png`. **Read that PNG to visually confirm the app rendered.**
+## Fast lanes for the user
+- **In Claude Code**: `/ui <change>` (a project skill in every scaffolded app). It runs one Haiku turn with the live context already injected, makes one `./ui apply --end-turn`, and a hook ends the turn. For long sessions, start `claude --model haiku` in the app folder.
+- **In a terminal**: `./ui ask "<change>"` is one direct Claude API call (needs `ANTHROPIC_API_KEY` + `uv`). `./ui ask -n 3 "<idea>"` builds 3 variants in parallel; switch with `./ui next` / `prev` / `keep`. `./ui chat` keeps the client warm.
+- **No model at all**: `./ui pick` (tap an element in the Simulator → its id), then `./ui tune` (single keys nudge size/padding/spacing/radius/weight, cycle colors and styles).
+- **Measure**: `./ui stats` prints p50/p90 for model time, write time and render confirmation.
 
-## Key facts & gotchas (learned the hard way)
-- **Build with `-destination 'generic/platform=iOS Simulator'`**, not a named device. Right after a runtime install, `xcodebuild` often only lists placeholder destinations, so a named `-destination` fails to match. The generic destination always resolves; target the concrete device later via `simctl`.
-- **Never `xcrun simctl runtime delete` a runtime image**, even one shown as a `Duplicate`/`Unusable`. Duplicates can share the same backing `.dmg`; deleting one removes the asset and forces a full ~8.5 GB re-download. If a runtime looks stuck, `killall Simulator; xcrun simctl shutdown all` and re-run `xcodebuild -downloadPlatform iOS` instead.
-- **Swift macros can fail on a freshly installed Xcode** with `external macro implementation type ... could not be found ...; swift-plugin-server produced malformed response` — this affects `#Preview`, `@Observable`, SwiftData `@Model`, etc., not just previews. The scaffold template is deliberately **macro-free** so headless builds are deterministic from day one. If you add a macro and hit this, it usually clears once Xcode.app has been opened in the GUI once (macOS finishes verifying the bundle and warms the plugin server); `run.sh` also retries the build once.
-- **The interactive steps belong to the user.** Installing Xcode (`xcodes install`, Apple ID + 2FA) and `sudo` toolchain config can't be typed by the agent — hand the user the exact command (e.g. via the `! <cmd>` prompt prefix) and wait.
-- **Free Apple ID** is enough to build and run on the Simulator. The paid Apple Developer Program ($99/yr) is only needed for App Store / TestFlight / device push.
-- Swift 6 language mode: set `SWIFT_VERSION: "6.0"` in `project.yml` (default `5.0` for a frictionless first build), then re-run `xcodegen generate`.
+## Key facts & gotchas
+- **Hot reload needs the project folder readable by the Simulator.** Keep projects out of `~/Documents`, `~/Desktop`, `~/Downloads` and iCloud Drive, which macOS privacy protection may block. `./ui status` shows `source` (env/defaults/source = live; `bundle` = not live).
+- **Build with `-destination 'generic/platform=iOS Simulator'` plus `ARCHS=arm64`.** The generic destination always resolves, even right after a runtime install, but it builds every simulator arch unless `ARCHS` is set. `run.sh` does both, skips indexing, reuses the XcodeGen cache, and boots the Simulator while it builds.
+- **Never `xcrun simctl runtime delete` a runtime image**, even one shown as `Duplicate`/`Unusable`. Duplicates can share one backing `.dmg`, so deleting one forces a ~8.5 GB re-download. If a runtime looks stuck: `killall Simulator; xcrun simctl shutdown all`, then re-run `xcodebuild -downloadPlatform iOS`.
+- **The templates are macro-free** (no `#Preview`, `@Observable`, `@Entry`). Swift macros can fail on a freshly installed Xcode (`swift-plugin-server produced malformed response`). The runtime uses `ObservableObject`. Keep `SWIFT_VERSION: "5.0"`: the runtime relies on Swift 5 concurrency rules.
+- **The interactive steps belong to the user.** `xcodes install` (Apple ID + 2FA) and `sudo xcode-select …` can't be typed by the agent. Hand the user the exact command and wait.
+- **A free Apple ID is enough** for the Simulator. The $99/yr program is only needed for App Store, TestFlight or device push.
+- **Physical iPhone**: the app runs from its bundled `design/` copy (no hot reload yet). Re-run `./run.sh` after design changes you want baked in.
 
 ## Useful one-liners
 ```bash
-xcrun simctl list devices available          # bootable simulators
-xcrun simctl list runtimes                   # installed iOS runtimes
-xcrun simctl io booted screenshot out.png    # screenshot the booted sim
-swiftlint ; swiftformat .                     # lint + auto-format
-open <AppName>.xcodeproj                      # open in Xcode for visual editing / Previews
+./ui context                  # what a model needs to know (current screen, ids, tokens, focus)
+./ui validate                 # check design/*.json
+./ui shot --small             # Simulator screenshot (+ ~900px JPEG)
+./run.sh --launch             # relaunch without building
+xcrun simctl list devices available
 ```
 
 ## Bundled files
-@templates/project.yml
-@templates/App.swift
-@templates/ContentView.swift
-@templates/run.sh
+@templates/tools/REFERENCE.md
 @scripts/doctor.sh
 @scripts/scaffold.sh

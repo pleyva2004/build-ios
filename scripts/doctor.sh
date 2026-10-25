@@ -52,4 +52,22 @@ for t in xcodegen xcbeautify swiftlint swiftformat aria2c fastlane; do
   fi
 done
 echo
+echo "-- Live-UI fast path (optional, for ./ui ask / ./ui chat) --"
+if command -v python3 >/dev/null 2>&1; then
+  echo "OK   python3 $(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))') (./ui core needs 3.7+)"
+else
+  echo "FAIL python3 missing  ->  xcode-select --install"
+fi
+if command -v uv >/dev/null 2>&1; then
+  echo "OK   uv -> $(command -v uv) (runs ./ui ask with a current anthropic SDK)"
+else
+  echo "WARN uv missing  ->  brew install uv   (only needed for ./ui ask outside Claude Code)"
+fi
+if [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -d "$HOME/.config/anthropic" ]; then
+  echo "OK   Claude API credentials found (./ui ask makes one direct API call)"
+else
+  echo "WARN no ANTHROPIC_API_KEY — ./ui ask falls back to 'claude -p' (slower); /ui inside Claude Code needs no key"
+fi
+command -v claude >/dev/null 2>&1 && echo "OK   claude -> $(command -v claude)" || echo "WARN Claude Code CLI not on PATH"
+echo
 echo "Doctor finished. Resolve any FAIL lines before building."

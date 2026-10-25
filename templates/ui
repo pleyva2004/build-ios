@@ -1,0 +1,2810 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["anthropic"]
+# ///
+"""ui — live UI engine for build-ios prototypes.
+
+The app's UI is JSON in design/. The app running in the iOS Simulator
+hot-reloads it (~0.2 s), so a UI change never needs a rebuild. This tool makes
+those changes fast and safe for people and for small, fast models:
+
+  ./ui context              compact map of the current screen (what a model reads)
+  ./ui apply '<ops>'        validate + apply id-addressed edits, wait for the render
+  ./ui undo                 revert the last apply
+  ./ui pick                 tap an element in the Simulator -> prints its id
+  ./ui ask "<request>"      one model call -> ops -> applied   (-n 3 for variants)
+  ./ui next | prev | keep   cycle / keep variants from `ask -n`
+  ./ui tune [id]            no-model fast lane: single keys nudge size/padding/color…
+  ./ui chat                 interactive loop (fastest: keeps the model client warm)
+  ./ui status | shot | stats | validate | reference
+  ./ui hook                 Claude Code hook entry point (see .claude/settings.json)
+
+Exit codes: 0 ok · 1 error · 2 validation failed (hook) · 3 ESCALATE (needs Swift)
+
+Ops reference: tools/REFERENCE.md. Core commands need only the python3 that
+ships with macOS; `ask`/`chat` call Claude via the official anthropic SDK
+(auto-run through `uv` when it isn't installed) or fall back to `claude -p`.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import copy
+import difflib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DEFAULT_MODEL = "claude-haiku-5-5"
+
+# --------------------------------------------------------------------------
+# Paths
+# --------------------------------------------------------------------------
+
+
+def find_project() -> Path:
+    env = os.environ.get("UI_PROJECT_DIR")
+    if env:
+        return Path(env).resolve()
+    here = Path(__file__).resolve().parent
+    if (here / "design" / "app.json").exists():
+        return here
+    cur = Path.cwd().resolve()
+    for p in [cur] + list(cur.parents):
+        if (p / "design" / "app.json").exists():
+            return p
+    return here
+
+
+class Project:
+    def __init__(self, root: Path):
+        self.root = root
+        self.design = root / "design"
+        self.live = root / ".live"
+        self.reference = root / "tools" / "REFERENCE.md"
+
+    def screen_path(self, sid: str) -> Path:
+        return self.design / "screens" / f"{sid}.json"
+
+
+def read_json(path: Path):
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def dump(obj) -> str:
+    return json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
+
+
+def compact(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+class UIError(Exception):
+    pass
+
+
+class Escalate(Exception):
+    """The request needs Swift (a custom component); exit code 3."""
+
+
+# --------------------------------------------------------------------------
+# Design model
+# --------------------------------------------------------------------------
+
+
+class Design:
+    """In-memory copy of design/*.json. Ops mutate it; save() writes changes."""
+
+    def __init__(self, project: Project):
+        self.project = project
+        self.app: dict = {}
+        self.tokens: dict = {}
+        self.screens: dict = {}
+        self.load_errors: list = []
+        self._original: dict = {}
+        self.load()
+
+    def load(self) -> None:
+        d = self.project.design
+        self.app = self._read(d / "app.json", "app.json", required=True)
+        self.tokens = self._read(d / "tokens.json", "tokens.json", required=False)
+        self.screens = {}
+        sdir = d / "screens"
+        if sdir.is_dir():
+            for p in sorted(sdir.glob("*.json")):
+                data = self._read(p, f"screens/{p.name}", required=True)
+                if isinstance(data, dict):
+                    self.screens[p.stem] = data
+        self._original = self.snapshot_texts()
+
+    def load_texts(self, texts: dict) -> None:
+        """Replace the in-memory content (keeps the on-disk original for diffing)."""
+        self.app = json.loads(texts.get("app.json", "{}"))
+        self.tokens = json.loads(texts.get("tokens.json", "{}"))
+        self.screens = {}
+        for name, text in sorted(texts.items()):
+            if name.startswith("screens/") and name.endswith(".json"):
+                self.screens[name[len("screens/"):-5]] = json.loads(text)
+
+    def _read(self, path: Path, label: str, required: bool):
+        if not path.exists():
+            if required:
+                self.load_errors.append(f"{label}: missing")
+            return {}
+        try:
+            data = read_json(path)
+        except json.JSONDecodeError as e:
+            self.load_errors.append(f"{label}: invalid JSON (line {e.lineno}, col {e.colno}): {e.msg}")
+            return {}
+        if not isinstance(data, dict):
+            self.load_errors.append(f"{label}: top level must be an object")
+            return {}
+        return data
+
+    # files ------------------------------------------------------------
+
+    def file_map(self) -> dict:
+        out = {"app.json": self.app, "tokens.json": self.tokens}
+        for sid, s in self.screens.items():
+            out[f"screens/{sid}.json"] = s
+        return out
+
+    def snapshot_texts(self) -> dict:
+        return {name: dump(obj) for name, obj in self.file_map().items()}
+
+    def changed_files(self) -> dict:
+        now = self.snapshot_texts()
+        changed = {k: v for k, v in now.items() if self._original.get(k) != v}
+        removed = [k for k in self._original if k not in now]
+        return {"write": changed, "remove": removed}
+
+    # tree walking -----------------------------------------------------
+
+    def walk(self):
+        """Yields Loc for every node (screens' body trees, templates, toolbar items)."""
+        for sid in sorted(self.screens):
+            screen = self.screens[sid]
+            body = screen.get("body")
+            if isinstance(body, dict):
+                yield from self._walk_node(sid, body, screen, "body", None, [])
+            elif isinstance(body, list):
+                for i, n in enumerate(body):
+                    if isinstance(n, dict):
+                        yield from self._walk_node(sid, n, body, i, None, [])
+            tb = screen.get("toolbar")
+            if isinstance(tb, list):
+                for i, n in enumerate(tb):
+                    if isinstance(n, dict):
+                        yield from self._walk_node(sid, n, tb, i, None, [])
+
+    def _walk_node(self, sid, node, holder, key, parent, ancestors):
+        loc = Loc(sid, node, holder, key, parent, list(ancestors))
+        yield loc
+        nid = node.get("id")
+        anc = ancestors + ([nid] if nid else [])
+        kids = node.get("children")
+        if isinstance(kids, list):
+            for i, c in enumerate(kids):
+                if isinstance(c, dict):
+                    yield from self._walk_node(sid, c, kids, i, node, anc)
+        tmpl = node.get("template")
+        if isinstance(tmpl, dict):
+            yield from self._walk_node(sid, tmpl, node, "template", node, anc)
+
+    def index(self) -> dict:
+        idx = {}
+        for loc in self.walk():
+            nid = loc.node.get("id")
+            if isinstance(nid, str) and nid not in idx:
+                idx[nid] = loc
+        return idx
+
+    def all_ids(self) -> list:
+        return [loc.node.get("id") for loc in self.walk() if isinstance(loc.node.get("id"), str)]
+
+    def find(self, nid) -> "Loc":
+        if not isinstance(nid, str) or not nid:
+            raise UIError(f"expected a node id, got {compact(nid)}")
+        loc = self.index().get(nid)
+        if loc is None:
+            raise UIError(f"no element with id '{nid}'.{suggest(nid, self.all_ids() + list(self.screens))}")
+        return loc
+
+    def tab_screens(self) -> list:
+        tabs = self.app.get("tabs")
+        if isinstance(tabs, list):
+            return [t.get("screen") or t.get("id") for t in tabs if isinstance(t, dict)]
+        return []
+
+    def default_screen(self) -> str:
+        tabs = self.tab_screens()
+        if tabs:
+            return tabs[0]
+        root = self.app.get("root")
+        if isinstance(root, str):
+            return root
+        return sorted(self.screens)[0] if self.screens else ""
+
+
+class Loc:
+    __slots__ = ("screen", "node", "holder", "key", "parent", "ancestors")
+
+    def __init__(self, screen, node, holder, key, parent, ancestors):
+        self.screen = screen
+        self.node = node
+        self.holder = holder  # list (children/toolbar/body list) or dict (repeat node / screen)
+        self.key = key  # index into list, or "template" / "body"
+        self.parent = parent  # parent node dict or None
+        self.ancestors = ancestors
+
+    @property
+    def in_list(self) -> bool:
+        return isinstance(self.holder, list)
+
+
+def suggest(word: str, candidates) -> str:
+    cands = [c for c in candidates if isinstance(c, str)]
+    close = difflib.get_close_matches(word, cands, n=3, cutoff=0.6)
+    return f" Did you mean {', '.join(close)}?" if close else ""
+
+
+# --------------------------------------------------------------------------
+# Vocabulary (mirrors Sources/Runtime/LiveRenderer.swift)
+# --------------------------------------------------------------------------
+
+CONTAINERS = {"vstack", "hstack", "zstack", "scroll", "grid", "list", "section"}
+COMMON_PROPS = {
+    "padding", "width", "height", "minWidth", "minHeight", "maxWidth", "maxHeight", "frameAlign",
+    "offset", "ignoreSafeArea", "background", "foreground", "tint", "opacity", "radius", "border",
+    "shadow", "glass", "font", "size", "weight", "design", "textAlign", "lines", "italic",
+    "onTap", "visibleIf", "disabled", "style", "placement",
+}
+TYPE_PROPS = {
+    "vstack": {"spacing", "align"},
+    "hstack": {"spacing", "align"},
+    "zstack": {"align"},
+    "scroll": {"axis", "spacing", "align"},
+    "grid": {"columns", "spacing"},
+    "list": {"listStyle"},
+    "section": {"header", "footer"},
+    "text": {"text"},
+    "label": {"text", "symbol"},
+    "image": {"symbol", "asset", "url", "fit", "aspect", "symbolMode"},
+    "button": {"text", "symbol", "variant", "action", "controlSize", "spacing"},
+    "toggle": {"text", "bind"},
+    "textfield": {"placeholder", "bind", "secure", "keyboard", "fieldStyle"},
+    "picker": {"text", "bind", "options", "pickerStyle"},
+    "shape": {"shape", "fill"},
+    "progress": {"value"},
+    "spacer": {"minLength"},
+    "divider": set(),
+    "repeat": {"items", "spacing"},
+    "custom": {"name"},
+}
+NODE_TYPES = set(TYPE_PROPS)
+HAS_CHILDREN = CONTAINERS | {"button"}
+STRUCTURAL = {"type", "id", "children", "template"}
+
+ALIGN_9 = {"center", "top", "bottom", "leading", "trailing", "topLeading", "topTrailing", "bottomLeading", "bottomTrailing"}
+ENUMS = {
+    "frameAlign": ALIGN_9,
+    "axis": {"vertical", "horizontal"},
+    "listStyle": {"insetGrouped", "plain", "grouped", "inset"},
+    "fit": {"fill", "fit"},
+    "symbolMode": {"hierarchical", "multicolor", "monochrome"},
+    "variant": {"primary", "secondary", "plain", "borderless", "destructive", "glass", "glassProminent"},
+    "controlSize": {"mini", "small", "regular", "large", "extraLarge"},
+    "keyboard": {"default", "email", "number", "decimal", "phone", "url"},
+    "fieldStyle": {"rounded", "plain"},
+    "pickerStyle": {"segmented", "menu", "wheel", "inline"},
+    "shape": {"rect", "rounded", "circle", "capsule"},
+    "textAlign": {"leading", "center", "trailing"},
+    "weight": {"ultraLight", "thin", "light", "regular", "medium", "semibold", "bold", "heavy", "black"},
+    "design": {"default", "rounded", "serif", "monospaced", "mono"},
+    "placement": {"leading", "trailing"},
+}
+ALIGN_BY_TYPE = {
+    "vstack": {"leading", "center", "trailing"},
+    "hstack": {"top", "center", "bottom", "firstTextBaseline", "baseline"},
+    "zstack": ALIGN_9,
+}
+TEXT_STYLES = {"largeTitle", "title", "title2", "title3", "headline", "subheadline", "body", "callout",
+               "footnote", "caption", "caption2"}
+NAMED_COLORS = {"blue", "red", "green", "orange", "pink", "purple", "teal", "indigo", "yellow", "mint", "cyan",
+                "brown", "gray", "grey", "black", "white", "clear", "primary", "label", "secondary",
+                "secondaryLabel", "accent", "accentColor", "systemBackground", "background",
+                "secondarySystemBackground", "systemGroupedBackground", "groupedBackground", "separator"}
+COLOR_PROPS = {"foreground", "tint", "fill"}
+# Bare words that should stay system colors even if a token has the same name.
+BASIC_COLORS = {"blue", "red", "green", "orange", "pink", "purple", "teal", "indigo", "yellow", "mint", "cyan",
+                "brown", "gray", "grey", "black", "white", "clear", "primary", "secondary"}
+NUMBER_PROPS = {"width", "height", "minWidth", "minHeight", "maxWidth", "maxHeight", "spacing", "minLength",
+                "size", "aspect", "opacity", "value"}
+INT_PROPS = {"columns", "lines"}
+BOOL_PROPS = {"ignoreSafeArea", "italic", "disabled", "secure"}
+ACTION_VERBS = {"navigate", "sheet", "dismiss", "tab", "toggle", "set", "url", "alert"}
+
+# Common small-model slips, fixed automatically (and reported).
+PROP_ALIASES = {
+    "margin": "padding", "cornerRadius": "radius", "borderRadius": "radius", "fontSize": "size", "fontWeight": "weight",
+    "backgroundColor": "background", "bg": "background", "foregroundColor": "foreground",
+    "textColor": "foreground", "color": "foreground", "gap": "spacing", "alignment": "align",
+    "systemImage": "symbol", "icon": "symbol", "sfSymbol": "symbol", "src": "url", "imageUrl": "url",
+    "image": "url", "onPress": "onTap", "onClick": "onTap", "lineLimit": "lines", "maxLines": "lines",
+    "title": "text", "label": "text", "content": "text", "cols": "columns", "buttonStyle": "variant",
+}
+TYPE_ALIASES = {
+    "VStack": "vstack", "HStack": "hstack", "ZStack": "zstack", "column": "vstack", "row": "hstack",
+    "stack": "vstack", "ScrollView": "scroll", "scrollview": "scroll", "Text": "text", "Image": "image",
+    "icon": "image", "Button": "button", "Toggle": "toggle", "switch": "toggle", "TextField": "textfield",
+    "input": "textfield", "Spacer": "spacer", "Divider": "divider", "separator": "divider", "List": "list",
+    "Section": "section", "Label": "label", "Picker": "picker", "segmented": "picker", "foreach": "repeat",
+    "ForEach": "repeat", "LazyVGrid": "grid", "ProgressView": "progress", "Rectangle": "shape",
+    "Circle": "shape", "rectangle": "shape", "circle": "shape", "capsule": "shape",
+}
+
+CSS_COLORS = {"coral": "#FF7F50", "navy": "#000080", "gold": "#FFD700", "salmon": "#FA8072", "crimson": "#DC143C",
+              "olive": "#808000", "maroon": "#800000", "lime": "#32CD32", "silver": "#C0C0C0", "violet": "#8F00FF",
+              "magenta": "#FF00FF", "turquoise": "#40E0D0", "beige": "#F5F5DC", "lavender": "#E6E6FA",
+              "slate": "#64748B", "charcoal": "#36454F", "cream": "#FFFDD0", "sky": "#0EA5E9", "emerald": "#10B981",
+              "rose": "#F43F5E", "amber": "#F59E0B", "aqua": "#00FFFF", "tan": "#D2B48C"}
+DIRECTION_FIX = {"left": "leading", "right": "trailing", "middle": "center", "centre": "center",
+                 "top-left": "topLeading", "top-right": "topTrailing", "bottom-left": "bottomLeading",
+                 "bottom-right": "bottomTrailing", "topLeft": "topLeading", "topRight": "topTrailing",
+                 "bottomLeft": "bottomLeading", "bottomRight": "bottomTrailing"}
+ALIGN_PROPS = {"align", "frameAlign", "textAlign"}
+
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]*$")
+
+
+def load_symbol_names():
+    """SF Symbol names from macOS (None when not on a Mac). Used to catch invented names."""
+    plist = Path("/System/Library/CoreServices/CoreGlyphs.bundle/Contents/Resources/name_availability.plist")
+    if not plist.exists():
+        return None
+    try:
+        import plistlib
+
+        with plist.open("rb") as f:
+            data = plistlib.load(f)
+        names = set((data.get("symbols") or {}).keys())
+        return names or None
+    except Exception:
+        return None
+
+
+_SYMBOLS = []
+
+
+def symbol_names():
+    if not _SYMBOLS:
+        _SYMBOLS.append(load_symbol_names())
+    return _SYMBOLS[0]
+HEX_RE = re.compile(r"^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+
+
+def slug(text: str, words: int = 2) -> str:
+    parts = re.findall(r"[a-z0-9]+", text.lower())
+    return "-".join(parts[:words])
+
+
+# --------------------------------------------------------------------------
+# Normalization (auto-fix) + id assignment
+# --------------------------------------------------------------------------
+
+
+class Fixer:
+    def __init__(self, design: Design):
+        self.design = design
+        self.notes: list = []
+        self.taken = set(design.all_ids()) | set(design.screens)
+
+    def new_id(self, base: str, hint: str) -> str:
+        """`<screen>.<slug>`: short ids that don't encode the tree, so they stay true after moves."""
+        hint = hint or "item"
+        base = (base or "").split(".")[0]
+        cand = f"{base}.{hint}" if base else hint
+        n = 2
+        out = cand
+        while out in self.taken:
+            out = f"{cand}{n}"
+            n += 1
+        self.taken.add(out)
+        return out
+
+    def hint_for(self, node: dict) -> str:
+        t = node.get("type", "node")
+        for k in ("text", "symbol", "name", "placeholder", "header"):
+            v = node.get(k)
+            if isinstance(v, str) and v.strip() and "{{" not in v:
+                s = slug(v.replace(".", " "))
+                if s:
+                    return s
+        return t if isinstance(t, str) else "node"
+
+    def normalize_props(self, node: dict, label: str) -> None:
+        t = node.get("type")
+        if isinstance(t, str) and t not in NODE_TYPES:
+            fixed = TYPE_ALIASES.get(t) or TYPE_ALIASES.get(t.lower()) or (t.lower() if t.lower() in NODE_TYPES else None)
+            if fixed:
+                if fixed == "shape" and t.lower() in {"rectangle", "circle", "capsule"} and "shape" not in node:
+                    node["shape"] = {"rectangle": "rect"}.get(t.lower(), t.lower())
+                node["type"] = fixed
+                self.notes.append(f"{label}: type {t}→{fixed}" if label else f": type {t}→{fixed}")
+                t = fixed
+        allowed = COMMON_PROPS | TYPE_PROPS.get(t, set()) | STRUCTURAL
+        for k in list(node.keys()):
+            if k in allowed or k.startswith("_") or t == "custom":
+                continue
+            target = PROP_ALIASES.get(k)
+            if k == "color" and t == "shape":
+                target = "fill"
+            if k == "image" and t == "button":
+                target = "symbol"
+            if k == "title" and t in {"section"}:
+                target = "header"
+            if k == "action" and t != "button":
+                target = "onTap"
+            if k == "onTap" and t == "button":
+                target = "action"
+            if target and target not in node and (target in allowed):
+                node[target] = node.pop(k)
+                self.notes.append(f"{label}: {k}→{target}" if label else f": {k}→{target}")
+        self.normalize_values(node, label)
+        # "style": "primary" on a button means variant (unless a style bundle has that name)
+        styles = self.design.tokens.get("styles") if isinstance(self.design.tokens.get("styles"), dict) else {}
+        if t == "button" and node.get("style") in ENUMS["variant"] and node.get("style") not in styles:
+            if "variant" not in node:
+                node["variant"] = node.pop("style")
+                self.notes.append(f"{label}: style→variant" if label else ": style→variant")
+
+    def normalize_values(self, node: dict, label: str) -> None:
+        tokens = self.design.tokens if isinstance(self.design.tokens, dict) else {}
+        colors = set(tokens.get("colors") or {}) | set(tokens.get("colorsDark") or {})
+        spaces = set(tokens.get("spacing") or {}) | set(tokens.get("radius") or {})
+        tag = label or ""
+        for k in list(node.keys()):
+            v = node[k]
+            if not isinstance(v, str) or "{{" in v:
+                continue
+            new = v
+            if k in COLOR_PROPS or k == "background":
+                if v in colors and v not in BASIC_COLORS:
+                    new = "$" + v
+                elif v.lower() in CSS_COLORS and v.lower() not in NAMED_COLORS:
+                    new = CSS_COLORS[v.lower()]
+            elif k in ALIGN_PROPS:
+                new = DIRECTION_FIX.get(v, v)
+            elif k in NUMBER_PROPS or k in ("radius", "padding"):
+                if v in spaces:
+                    new = "$" + v
+                else:
+                    try:
+                        num = float(v)
+                        new = int(num) if num.is_integer() else num
+                    except ValueError:
+                        pass
+            elif k in ENUMS and v not in ENUMS[k]:
+                low = {e.lower(): e for e in ENUMS[k]}
+                new = low.get(v.lower(), v)
+            if new != v:
+                node[k] = new
+                self.notes.append(f"{tag}: {k} {compact(v)}→{compact(new)}")
+        op = node.get("opacity")
+        if isinstance(op, (int, float)) and not isinstance(op, bool) and 1 < op <= 100:
+            node["opacity"] = round(op / 100, 3)
+            self.notes.append(f"{tag}: opacity {op}→{node['opacity']}")
+
+    def fix_tree(self, node, parent_id: str) -> None:
+        if not isinstance(node, dict):
+            return
+        before = len(self.notes)
+        self.normalize_props(node, "")
+        if not isinstance(node.get("id"), str) or not node.get("id"):
+            node["id"] = self.new_id(parent_id, self.hint_for(node))
+            # move id right after type for readable files
+            items = list(node.items())
+            node.clear()
+            order = [kv for kv in items if kv[0] == "type"] + [kv for kv in items if kv[0] == "id"] + \
+                [kv for kv in items if kv[0] not in ("type", "id")]
+            node.update(order)
+        nid = node["id"]
+        self.notes[before:] = [f"{nid}{n}" for n in self.notes[before:]]
+        kids = node.get("children")
+        if isinstance(kids, list):
+            for c in kids:
+                self.fix_tree(c, nid)
+        if isinstance(node.get("template"), dict):
+            self.fix_tree(node["template"], nid)
+
+
+# --------------------------------------------------------------------------
+# Validation
+# --------------------------------------------------------------------------
+
+
+class Validator:
+    def __init__(self, design: Design):
+        self.d = design
+        self.errors: list = []
+        self.warnings: list = []
+        tk = design.tokens if isinstance(design.tokens, dict) else {}
+        self.colors = set(tk.get("colors", {}) or {}) | set(tk.get("colorsDark", {}) or {})
+        self.fonts = set(tk.get("fonts", {}) or {})
+        self.spacing = set(tk.get("spacing", {}) or {})
+        self.radius = set(tk.get("radius", {}) or {})
+        self.shadows = set(tk.get("shadows", {}) or {})
+        self.styles = tk.get("styles", {}) if isinstance(tk.get("styles"), dict) else {}
+        status = Live(design.project).status() or {}
+        comps = status.get("components")
+        self.components = set(comps) if isinstance(comps, dict) else None
+
+    def err(self, where: str, msg: str) -> None:
+        self.errors.append(f"{where}: {msg}")
+
+    def run(self) -> "Validator":
+        self.errors.extend(self.d.load_errors)
+        self.check_app()
+        seen: dict = {}
+        for sid, screen in self.d.screens.items():
+            self.check_screen(sid, screen)
+        for loc in self.d.walk():
+            nid = loc.node.get("id")
+            where = f"screens/{loc.screen}.json"
+            if not isinstance(nid, str) or not nid:
+                self.err(f"{where} ({loc.node.get('type', '?')} under {loc.ancestors[-1] if loc.ancestors else loc.screen})",
+                         "missing \"id\"")
+            elif not ID_RE.match(nid):
+                self.err(nid, "id may only use letters, digits, '.', '_' and '-'")
+            elif nid.startswith("ex."):
+                self.err(nid, "ids starting with 'ex.' come from the reference examples; use the real ids in the context")
+            elif nid in seen:
+                self.err(nid, f"duplicate id (also in screens/{seen[nid]}.json)")
+            else:
+                seen[nid] = loc.screen
+            self.check_node(loc)
+        for sid in self.d.screens:
+            if sid in seen:
+                self.err(sid, "a node id equals a screen id; rename the node")
+        self.check_tokens()
+        return self
+
+    # app / screens ------------------------------------------------------
+
+    def check_app(self) -> None:
+        app = self.d.app
+        tabs = app.get("tabs")
+        if tabs is not None:
+            if not isinstance(tabs, list) or not tabs:
+                self.err("app.json", "\"tabs\" must be a non-empty list")
+            else:
+                ids = set()
+                for i, t in enumerate(tabs):
+                    if not isinstance(t, dict):
+                        self.err(f"app.json tabs[{i}]", "must be an object")
+                        continue
+                    tid = t.get("id")
+                    if not isinstance(tid, str):
+                        self.err(f"app.json tabs[{i}]", "needs \"id\"")
+                    elif tid in ids:
+                        self.err(f"app.json tabs[{i}]", f"duplicate tab id '{tid}'")
+                    ids.add(tid)
+                    scr = t.get("screen") or tid
+                    if scr not in self.d.screens:
+                        self.err(f"app.json tabs[{i}]", f"screen '{scr}' does not exist.{suggest(str(scr), self.d.screens)}")
+        else:
+            root = app.get("root")
+            if root is None and not self.d.screens:
+                self.err("app.json", "needs \"tabs\" or \"root\"")
+            elif root is not None and root not in self.d.screens:
+                self.err("app.json", f"root screen '{root}' does not exist.{suggest(str(root), self.d.screens)}")
+        if "tint" in app:
+            self.check_color("app.json", "tint", app["tint"])
+        cs = app.get("colorScheme")
+        if cs is not None and cs not in {"light", "dark", "system"}:
+            self.err("app.json", "colorScheme must be light, dark or system")
+        if "state" in app and not isinstance(app["state"], dict):
+            self.err("app.json", "\"state\" must be an object")
+
+    def check_screen(self, sid: str, screen: dict) -> None:
+        where = f"screens/{sid}.json"
+        if screen.get("id") not in (None, sid):
+            self.err(where, f"\"id\" is '{screen.get('id')}' but the file is {sid}.json")
+        if "titleDisplay" in screen and screen["titleDisplay"] not in {"large", "inline", "hidden"}:
+            self.err(where, "titleDisplay must be large, inline or hidden")
+        if "background" in screen:
+            self.check_fill(where, "background", screen["background"])
+        if "data" in screen and not isinstance(screen["data"], dict):
+            self.err(where, "\"data\" must be an object")
+        if "toolbar" in screen and not isinstance(screen["toolbar"], list):
+            self.err(where, "\"toolbar\" must be a list of nodes")
+        body = screen.get("body")
+        if body is None:
+            self.err(where, "missing \"body\"")
+        elif not isinstance(body, (dict, list)):
+            self.err(where, "\"body\" must be a node")
+
+    # nodes --------------------------------------------------------------
+
+    def check_node(self, loc: Loc) -> None:
+        n = loc.node
+        nid = n.get("id") if isinstance(n.get("id"), str) else f"({loc.screen})"
+        t = n.get("type")
+        if not isinstance(t, str) or t not in NODE_TYPES:
+            self.err(nid, f"unknown type {compact(t)}.{suggest(str(t), NODE_TYPES)} Types: {', '.join(sorted(NODE_TYPES))}")
+            return
+        allowed = COMMON_PROPS | TYPE_PROPS[t] | STRUCTURAL
+        for k, v in n.items():
+            if k.startswith("_"):
+                continue
+            if t == "custom" and k not in STRUCTURAL:
+                continue
+            if k not in allowed:
+                alias = PROP_ALIASES.get(k)
+                hint = f" Use \"{alias}\"." if alias in allowed else suggest(k, allowed - STRUCTURAL)
+                self.err(nid, f"\"{k}\" is not a {t} property.{hint}")
+                continue
+            self.check_prop(nid, t, k, v)
+        if "children" in n:
+            if t not in HAS_CHILDREN:
+                self.err(nid, f"a {t} cannot have children")
+            elif not isinstance(n["children"], list):
+                self.err(nid, "\"children\" must be a list")
+        if t == "repeat":
+            if not isinstance(n.get("template"), dict):
+                self.err(nid, "repeat needs a \"template\" node")
+            if "items" not in n:
+                self.err(nid, "repeat needs \"items\" (\"data.<key>\", a list, or a count)")
+            else:
+                self.check_items(loc, n["items"])
+        elif "template" in n:
+            self.err(nid, "only repeat nodes have \"template\"")
+        if t == "image" and not any(k in n for k in ("symbol", "asset", "url")):
+            self.err(nid, "image needs \"symbol\", \"asset\" or \"url\"")
+        if t == "custom" and not isinstance(n.get("name"), str):
+            self.err(nid, "custom needs \"name\"")
+        elif t == "custom" and self.components is not None and n["name"] not in self.components:
+            self.warnings.append(f"{nid}: custom '{n['name']}' is not registered in Sources/Components "
+                                 f"(known: {', '.join(sorted(self.components)) or 'none'}) — it needs Swift + ./run.sh")
+        # props that are valid but would change nothing on screen
+        if "frameAlign" in n and not any(k in n for k in ("width", "height", "maxWidth", "maxHeight", "minWidth", "minHeight")):
+            self.warnings.append(f"{nid}: frameAlign does nothing without width/height/maxWidth (try maxWidth:\"infinity\")")
+        if "textAlign" in n and t == "text" and "maxWidth" not in n and "width" not in n:
+            self.warnings.append(f"{nid}: textAlign only affects multi-line text; to center a line also set maxWidth:\"infinity\" + frameAlign:\"center\"")
+        if t == "section" and loc.parent is not None and loc.parent.get("type") not in ("list",) and loc.key != "template":
+            self.warnings.append(f"{nid}: section outside a list renders as a titled column")
+
+    def is_dynamic(self, v) -> bool:
+        return isinstance(v, str) and "{{" in v
+
+    def check_prop(self, nid: str, t: str, k: str, v) -> None:
+        if v is None:
+            self.err(nid, f"\"{k}\" is null (omit it instead)")
+            return
+        if self.is_dynamic(v):
+            return
+        if k == "align":
+            allowed = ALIGN_BY_TYPE.get(t, ALIGN_9)
+            if t == "scroll":
+                allowed = ALIGN_BY_TYPE["vstack"] | ALIGN_BY_TYPE["hstack"]
+            if v not in allowed:
+                self.err(nid, f"align '{v}' not valid for {t}; use one of {', '.join(sorted(allowed))}")
+        elif k in ENUMS:
+            if v not in ENUMS[k]:
+                self.err(nid, f"{k} '{v}' must be one of {', '.join(sorted(ENUMS[k]))}")
+        elif k == "background":
+            self.check_fill(nid, k, v)
+        elif k in COLOR_PROPS:
+            self.check_color(nid, k, v)
+        elif k == "radius":
+            self.check_number(nid, k, v, self.radius | self.spacing)
+        elif k in NUMBER_PROPS:
+            self.check_number(nid, k, v, self.spacing | self.radius)
+        elif k in INT_PROPS:
+            if not (isinstance(v, int) and not isinstance(v, bool)):
+                self.err(nid, f"{k} must be an integer")
+            elif k == "columns" and not 1 <= v <= 12:
+                self.err(nid, "columns must be 1–12")
+            elif k == "lines" and v < 1:
+                self.err(nid, "lines must be 1 or more")
+        elif k in BOOL_PROPS:
+            if not isinstance(v, bool):
+                self.err(nid, f"{k} must be true or false")
+        elif k == "padding":
+            self.check_padding(nid, v)
+        elif k == "font":
+            self.check_font(nid, v)
+        elif k == "shadow":
+            self.check_shadow(nid, v)
+        elif k == "style":
+            name = v[1:] if isinstance(v, str) and v.startswith("$") else v
+            if not isinstance(name, str) or name not in self.styles:
+                hint = " (for button looks use \"variant\")" if t == "button" and name in ENUMS["variant"] else ""
+                self.err(nid, f"style '{v}' is not in tokens.styles{hint}.{suggest(str(name), self.styles)}")
+        elif k in ("action", "onTap"):
+            self.check_action(nid, v)
+        elif k == "glass":
+            if v not in (True, False, "regular", "clear", "none"):
+                self.err(nid, "glass must be true, false, \"regular\" or \"clear\"")
+        elif k == "offset":
+            if not isinstance(v, dict) or set(v) - {"x", "y"}:
+                self.err(nid, "offset must be {\"x\": n, \"y\": n}")
+        elif k == "border":
+            if not isinstance(v, dict) or set(v) - {"color", "width"}:
+                self.err(nid, "border must be {\"color\": c, \"width\": n}")
+            elif "color" in v:
+                self.check_color(nid, "border.color", v["color"])
+        elif k == "options":
+            if not isinstance(v, list) or not all(isinstance(o, (str, int, float)) for o in v):
+                self.err(nid, "options must be a list of strings")
+        elif k == "visibleIf":
+            if not isinstance(v, str) or not v.strip():
+                self.err(nid, "visibleIf must be \"key\", \"!key\" or \"key==value\"")
+        elif k in ("text", "symbol", "asset", "url", "placeholder", "bind", "header", "footer", "name"):
+            if not isinstance(v, (str, int, float)) or isinstance(v, bool):
+                self.err(nid, f"{k} must be a string")
+            elif k == "symbol" and isinstance(v, str):
+                names = symbol_names()
+                if names is not None and v not in names:
+                    self.err(nid, f"'{v}' is not an SF Symbol name.{suggest(v, names)}")
+
+    def check_color(self, where: str, k: str, v) -> None:
+        if self.is_dynamic(v):
+            return
+        if not isinstance(v, str):
+            self.err(where, f"{k} must be a color string")
+        elif v.startswith("$"):
+            if v[1:] not in self.colors:
+                self.err(where, f"{k}: no color token '{v}'.{suggest(v[1:], self.colors)} Add it with "
+                                f"{{\"op\":\"token\",\"path\":\"colors.{v[1:]}\",\"value\":\"#RRGGBB\"}}")
+        elif v.startswith("#"):
+            if not HEX_RE.match(v):
+                self.err(where, f"{k}: '{v}' is not #RGB, #RRGGBB or #RRGGBBAA")
+        elif v not in NAMED_COLORS:
+            self.err(where, f"{k}: unknown color '{v}' (use #RRGGBB, a $token, or a system name).{suggest(v, NAMED_COLORS)}")
+
+    def check_fill(self, where: str, k: str, v) -> None:
+        if isinstance(v, dict):
+            stops = v.get("gradient")
+            if not isinstance(stops, list) or len(stops) < 2:
+                self.err(where, f"{k}: gradient needs a list of 2+ colors")
+                return
+            for c in stops:
+                self.check_color(where, f"{k}.gradient", c)
+            if v.get("direction", "down") not in {"down", "up", "right", "diagonal"}:
+                self.err(where, f"{k}: direction must be down, up, right or diagonal")
+        else:
+            self.check_color(where, k, v)
+
+    LIMITS = {"opacity": (0, 1), "size": (1, 400), "aspect": (0.05, 20), "value": (0, 1)}
+
+    def check_number(self, where: str, k: str, v, tokens: set) -> None:
+        if isinstance(v, bool):
+            self.err(where, f"{k} must be a number")
+        elif isinstance(v, (int, float)):
+            lo, hi = self.LIMITS.get(k.split(".")[-1], (-100000, 100000))
+            if v != v or not (lo <= v <= hi):
+                self.err(where, f"{k} must be between {lo} and {hi}")
+        elif isinstance(v, str):
+            if v.startswith("$"):
+                if v[1:] not in tokens:
+                    self.err(where, f"{k}: no spacing/radius token '{v}'.{suggest(v[1:], tokens)}")
+            elif v in ("infinity", "inf", "max"):
+                if k not in {"width", "height", "maxWidth", "maxHeight"}:
+                    self.err(where, f"{k} cannot be infinity")
+            else:
+                try:
+                    float(v)
+                except ValueError:
+                    self.err(where, f"{k} must be a number, a $token or \"infinity\"")
+        else:
+            self.err(where, f"{k} must be a number")
+
+    def check_padding(self, where: str, v) -> None:
+        if isinstance(v, dict):
+            bad = set(v) - {"top", "bottom", "leading", "trailing", "horizontal", "vertical", "all"}
+            if bad:
+                self.err(where, f"padding keys must be top/bottom/leading/trailing/horizontal/vertical (got {', '.join(sorted(bad))})")
+            for kk, vv in v.items():
+                if kk not in bad:
+                    self.check_number(where, f"padding.{kk}", vv, self.spacing)
+        else:
+            self.check_number(where, "padding", v, self.spacing)
+
+    def check_font(self, where: str, v) -> None:
+        if isinstance(v, str):
+            if v.startswith("$"):
+                if v[1:] not in self.fonts:
+                    self.err(where, f"font: no font token '{v}'.{suggest(v[1:], self.fonts)}")
+            elif v not in TEXT_STYLES:
+                self.err(where, f"font '{v}' is not a token or a text style ({', '.join(sorted(TEXT_STYLES))})")
+        elif isinstance(v, dict):
+            bad = set(v) - {"size", "weight", "design", "style"}
+            if bad:
+                self.err(where, f"font object keys are size/weight/design/style (got {', '.join(sorted(bad))})")
+            if "weight" in v and v["weight"] not in ENUMS["weight"]:
+                self.err(where, f"font weight must be one of {', '.join(sorted(ENUMS['weight']))}")
+        else:
+            self.err(where, "font must be a $token, a text style name, or {\"size\",\"weight\",\"design\"}")
+
+    def check_shadow(self, where: str, v) -> None:
+        if isinstance(v, str):
+            if v == "none":
+                return
+            name = v[1:] if v.startswith("$") else v
+            if name not in self.shadows:
+                self.err(where, f"shadow: no shadow token '{v}'.{suggest(name, self.shadows)}")
+        elif isinstance(v, dict):
+            bad = set(v) - {"radius", "x", "y", "color", "opacity"}
+            if bad:
+                self.err(where, f"shadow keys are radius/x/y/color/opacity (got {', '.join(sorted(bad))})")
+        else:
+            self.err(where, "shadow must be a $token or an object")
+
+    def check_action(self, where: str, v) -> None:
+        if isinstance(v, list):
+            for a in v:
+                self.check_action(where, a)
+            return
+        if not isinstance(v, dict):
+            self.err(where, "action must be an object like {\"navigate\":\"screen\"}")
+            return
+        verbs = [k for k in v if k in ACTION_VERBS]
+        extra = [k for k in v if k not in ACTION_VERBS and k != "params"]
+        if len(verbs) != 1 or extra:
+            self.err(where, f"action needs exactly one of {', '.join(sorted(ACTION_VERBS))} (got {compact(v)})")
+            return
+        verb = verbs[0]
+        target = v[verb]
+        if verb in ("navigate", "sheet") and not self.is_dynamic(target):
+            if target not in self.d.screens:
+                self.err(where, f"{verb}: screen '{target}' does not exist.{suggest(str(target), self.d.screens)} "
+                                f"Create it with a \"screen\" op.")
+        if verb == "tab":
+            tabs = [t.get("id") for t in self.d.app.get("tabs", []) if isinstance(t, dict)]
+            if target not in tabs:
+                self.err(where, f"tab '{target}' does not exist.{suggest(str(target), tabs)}")
+        if verb == "set" and not isinstance(target, dict):
+            self.err(where, "set needs an object of state values")
+        if verb == "alert" and not isinstance(target, dict):
+            self.err(where, "alert needs {\"title\",\"message\"}")
+        if "params" in v and not isinstance(v["params"], dict):
+            self.err(where, "params must be an object")
+
+    def check_items(self, loc: Loc, items) -> None:
+        nid = loc.node.get("id", "repeat")
+        if isinstance(items, list) or (isinstance(items, int) and not isinstance(items, bool)):
+            n = len(items) if isinstance(items, list) else items
+            if not 0 <= n <= 500:
+                self.err(nid, "repeat renders at most 500 items")
+            return
+        if not isinstance(items, str):
+            self.err(nid, "items must be \"data.<key>\", a list, or a count")
+            return
+        path = items.replace("{{", "").replace("}}", "").lstrip("$").strip()
+        if path.startswith("data."):
+            data = self.d.screens.get(loc.screen, {}).get("data", {})
+            if resolve_path(data, path[5:]) is None:
+                keys = list(data) if isinstance(data, dict) else []
+                self.err(nid, f"items '{items}': screens/{loc.screen}.json has no data.{path[5:]}.{suggest(path[5:], keys)}")
+
+    def check_tokens(self) -> None:
+        tk = self.d.tokens
+        if not isinstance(tk, dict):
+            return
+        for group in ("colors", "colorsDark"):
+            for name, val in (tk.get(group) or {}).items():
+                if isinstance(val, str) and val.startswith("$"):
+                    if val[1:] not in self.colors:
+                        self.err(f"tokens.{group}.{name}", f"refers to missing color '{val}'")
+                else:
+                    self.check_color(f"tokens.{group}.{name}", "value", val)
+        for group in ("spacing", "radius"):
+            for name, val in (tk.get(group) or {}).items():
+                if not isinstance(val, (int, float)) or isinstance(val, bool):
+                    self.err(f"tokens.{group}.{name}", "must be a number")
+        for name, val in (tk.get("fonts") or {}).items():
+            self.check_font(f"tokens.fonts.{name}", val)
+        for name, bundle in self.styles.items():
+            if not isinstance(bundle, dict):
+                self.err(f"tokens.styles.{name}", "must be an object of props")
+                continue
+            for k, v in bundle.items():
+                if k not in COMMON_PROPS and not any(k in s for s in TYPE_PROPS.values()):
+                    self.err(f"tokens.styles.{name}", f"unknown prop \"{k}\"")
+                elif k == "style":
+                    self.err(f"tokens.styles.{name}", "styles cannot nest \"style\"")
+                else:
+                    self.check_prop(f"tokens.styles.{name}", "style", k, v)
+
+
+def resolve_path(root, path: str):
+    cur = root
+    for part in [p for p in path.split(".") if p]:
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+            cur = cur[int(part)]
+        else:
+            return None
+    return cur
+
+
+# --------------------------------------------------------------------------
+# Ops
+# --------------------------------------------------------------------------
+
+OP_NAMES = ("set", "insert", "remove", "move", "replace", "wrap", "unwrap", "token", "screen", "path", "nudge", "data")
+
+TYPE_SCALE = [11, 12, 13, 15, 17, 20, 22, 24, 28, 34, 40, 48, 56, 64]
+TEXT_STYLE_SIZES = {"largeTitle": 34, "title": 28, "title2": 22, "title3": 20, "headline": 17, "body": 17,
+                    "callout": 16, "subheadline": 15, "footnote": 13, "caption": 12, "caption2": 11}
+WEIGHT_ORDER = ["ultraLight", "thin", "light", "regular", "medium", "semibold", "bold", "heavy", "black"]
+NUDGE_PROPS = ("size", "padding", "spacing", "radius", "weight", "opacity", "width", "height")
+
+
+def parse_ops(raw) -> list:
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.startswith("@"):
+            text = Path(text[1:]).read_text(encoding="utf-8")
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as e:
+            extracted = extract_json(text)
+            if extracted is None:
+                raise UIError(f"ops are not valid JSON: {e.msg} (line {e.lineno}, col {e.colno})")
+            raw = extracted
+    if isinstance(raw, dict) and "ops" in raw:
+        raw = raw["ops"]
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise UIError("ops must be an op object or a list of ops")
+    for i, op in enumerate(raw):
+        if not isinstance(op, dict) or op.get("op") not in OP_NAMES:
+            got = op.get("op") if isinstance(op, dict) else op
+            raise UIError(f"op #{i + 1}: unknown op {compact(got)}.{suggest(str(got), OP_NAMES)} Ops: {', '.join(OP_NAMES)}")
+    return raw
+
+
+def extract_json(text: str):
+    """Pulls the first JSON object/array out of model text (handles ``` fences)."""
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    if fence:
+        try:
+            return json.loads(fence.group(1))
+        except json.JSONDecodeError:
+            pass
+    pairs = sorted((("{", "}"), ("[", "]")), key=lambda oc: (text.find(oc[0]) == -1, text.find(oc[0])))
+    for opener, closer in pairs:
+        start = text.find(opener)
+        while start != -1:
+            depth = 0
+            in_str = False
+            esc = False
+            for i in range(start, len(text)):
+                ch = text[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                elif ch == opener:
+                    depth += 1
+                elif ch == closer:
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start:i + 1])
+                        except json.JSONDecodeError:
+                            break
+            start = text.find(opener, start + 1)
+    return None
+
+
+def set_path(root, path: str, value, label: str):
+    parts = [p for p in str(path).split(".") if p != ""]
+    if not parts:
+        raise UIError(f"{label}: empty path")
+    cur = root
+    for i, part in enumerate(parts[:-1]):
+        nxt = parts[i + 1]
+        if isinstance(cur, dict):
+            if part not in cur or not isinstance(cur[part], (dict, list)):
+                if value is None:
+                    return
+                cur[part] = [] if nxt.isdigit() else {}
+            cur = cur[part]
+        elif isinstance(cur, list):
+            if not part.isdigit() or int(part) >= len(cur):
+                raise UIError(f"{label}: index '{part}' out of range in '{path}'")
+            cur = cur[int(part)]
+        else:
+            raise UIError(f"{label}: cannot descend into '{part}' in '{path}'")
+    last = parts[-1]
+    if isinstance(cur, dict):
+        if value is None:
+            cur.pop(last, None)
+        else:
+            cur[last] = value
+    elif isinstance(cur, list):
+        if last in ("-", "append"):
+            if value is not None:
+                cur.append(value)
+        elif last.isdigit() and int(last) < len(cur):
+            if value is None:
+                del cur[int(last)]
+            else:
+                cur[int(last)] = value
+        elif last.isdigit() and int(last) == len(cur) and value is not None:
+            cur.append(value)
+        else:
+            raise UIError(f"{label}: index '{last}' out of range in '{path}'")
+    else:
+        raise UIError(f"{label}: cannot set '{last}' in '{path}'")
+
+
+class Applier:
+    """Applies ops to a Design in memory, recording which ids changed."""
+
+    def __init__(self, design: Design):
+        self.d = design
+        self.fixer = Fixer(design)
+        self.changed: list = []
+        self.summary: list = []
+
+    def mark(self, *ids) -> None:
+        for i in ids:
+            if i and i not in self.changed:
+                self.changed.append(i)
+
+    def apply_all(self, ops: list) -> None:
+        for i, op in enumerate(ops):
+            try:
+                getattr(self, "op_" + op["op"])(op)
+            except UIError as e:
+                raise UIError(f"op #{i + 1} ({op['op']}): {e}")
+
+    # targets --------------------------------------------------------------
+
+    def resolve_slot(self, op: dict):
+        """Returns (list, index) where a node should go, from after/before/parent(+index)."""
+        if "after" in op or "before" in op:
+            ref = op.get("after", op.get("before"))
+            loc = self.d.find(ref)
+            if not loc.in_list:
+                raise UIError(f"'{ref}' is a {'repeat template' if loc.key == 'template' else 'screen body'}; "
+                              f"insert into its parent or wrap it instead")
+            return loc.holder, loc.key + (1 if "after" in op else 0)
+        if "parent" in op:
+            pid = op["parent"]
+            if isinstance(pid, str) and pid.endswith(".toolbar") and pid[:-8] in self.d.screens \
+                    and pid not in self.d.index():
+                holder = self.d.screens[pid[:-8]].setdefault("toolbar", [])
+                idx = op.get("index", len(holder))
+                if not isinstance(idx, int) or isinstance(idx, bool):
+                    raise UIError("index must be an integer")
+                return holder, max(0, min(idx if idx >= 0 else len(holder) + 1 + idx, len(holder)))
+            if pid in self.d.screens and pid not in self.d.index():
+                body = self.d.screens[pid].get("body")
+                if isinstance(body, list):
+                    holder = body
+                elif isinstance(body, dict) and body.get("type") in CONTAINERS:
+                    holder = body.setdefault("children", [])
+                else:
+                    raise UIError(f"screen '{pid}' body is not a container; use replace on its body")
+            else:
+                loc = self.d.find(pid)
+                ptype = loc.node.get("type")
+                if ptype == "repeat":
+                    raise UIError(f"'{pid}' is a repeat; insert into its template ('{loc.node.get('template', {}).get('id')}') instead")
+                if ptype not in HAS_CHILDREN:
+                    raise UIError(f"'{pid}' is a {ptype} and cannot have children; use wrap to group it with the new node")
+                holder = loc.node.setdefault("children", [])
+            idx = op.get("index", len(holder))
+            if not isinstance(idx, int) or isinstance(idx, bool):
+                raise UIError("index must be an integer")
+            if idx < 0:
+                idx = len(holder) + 1 + idx
+            return holder, max(0, min(idx, len(holder)))
+        raise UIError("needs \"after\", \"before\" or \"parent\"")
+
+    def parent_id_of_slot(self, holder) -> str:
+        for loc in self.d.walk():
+            if loc.node.get("children") is holder:
+                return loc.node.get("id", "")
+        for sid, s in self.d.screens.items():
+            if s.get("toolbar") is holder:
+                return sid
+            if s.get("body") is holder:
+                return sid
+        return ""
+
+    def new_node(self, node, parent_id: str) -> dict:
+        if not isinstance(node, dict):
+            raise UIError("\"node\" must be an object")
+        node = copy.deepcopy(node)
+        self.fixer.fix_tree(node, parent_id)
+        return node
+
+    # ops -------------------------------------------------------------------
+
+    def op_set(self, op: dict) -> None:
+        nid = op.get("id")
+        props = op.get("props")
+        if not isinstance(props, dict) or not props:
+            raise UIError("needs \"props\": {...}")
+        if nid in self.d.screens and nid not in self.d.index():
+            screen = self.d.screens[nid]
+            for k, v in props.items():
+                if k in ("id", "body"):
+                    raise UIError(f"cannot set screen '{k}' with set (use replace on the body / a screen op)")
+                if k == "toolbar" and screen.get("toolbar") and op.get("replaceToolbar") is not True:
+                    raise UIError(f"set would replace the whole toolbar; insert with \"parent\":\"{nid}.toolbar\" "
+                                  f"or remove items by id")
+                if k == "data" and screen.get("data"):
+                    raise UIError("set would replace all demo data; use {\"op\":\"data\",\"screen\":...,\"path\":...}")
+                if v is None:
+                    screen.pop(k, None)
+                elif k == "toolbar" and isinstance(v, list):
+                    screen[k] = [self.new_node(n, nid) for n in v]
+                else:
+                    screen[k] = v
+            self.mark(nid)
+            self.summary.append(f"set {nid} " + " ".join(f"{k}={fmt_value(v, 40)}" for k, v in props.items()))
+            return
+        loc = self.d.find(nid)
+        node = loc.node
+        tmp = dict(props)
+        user_set_type = "type" in tmp
+        if not user_set_type:
+            tmp["type"] = node.get("type")
+        self.fixer.normalize_props(tmp, nid)  # fixes aliases like cornerRadius -> radius
+        if not user_set_type:
+            tmp.pop("type", None)
+        for k, v in tmp.items():
+            if k == "id":
+                if v != nid and v in self.d.index():
+                    raise UIError(f"id '{v}' is already used")
+            if k in ("children",) and isinstance(v, list):
+                node[k] = [self.new_node(c, nid) for c in v]
+            elif k == "template" and isinstance(v, dict):
+                node[k] = self.new_node(v, nid)
+            elif v is None:
+                node.pop(k, None)
+            else:
+                node[k] = v
+        self.mark(node.get("id"))
+        self.summary.append(f"set {nid} " + " ".join(f"{k}={fmt_value(v, 40)}" for k, v in tmp.items()))
+
+    def op_insert(self, op: dict) -> None:
+        holder, idx = self.resolve_slot(op)
+        node = self.new_node(op.get("node"), self.parent_id_of_slot(holder))
+        holder.insert(idx, node)
+        self.mark(node["id"])
+        self.summary.append(f"insert {node['id']} ({node.get('type')})")
+
+    def op_remove(self, op: dict) -> None:
+        ids = op.get("ids")
+        if isinstance(ids, list):
+            for one in ids:
+                self.op_remove({"op": "remove", "id": one})
+            return
+        nid = op.get("id")
+        loc = self.d.find(nid)
+        if not loc.in_list:
+            raise UIError(f"'{nid}' is a {'repeat template' if loc.key == 'template' else 'screen body'}; "
+                          f"remove its parent or use replace")
+        del loc.holder[loc.key]
+        if loc.parent is not None:
+            self.mark(loc.parent.get("id"))
+        self.summary.append(f"remove {nid}")
+
+    def op_move(self, op: dict) -> None:
+        nid = op.get("id")
+        loc = self.d.find(nid)
+        if not loc.in_list:
+            raise UIError(f"'{nid}' cannot be moved (it is a template or screen body)")
+        ref = op.get("after", op.get("before", op.get("parent")))
+        if ref == nid:
+            raise UIError("cannot move an element relative to itself")
+        node = loc.node
+        if ref in self.d.index() and ref in subtree_ids(node):
+            raise UIError(f"cannot move '{nid}' inside itself")
+        del loc.holder[loc.key]
+        try:
+            holder, idx = self.resolve_slot(op)
+        except UIError:
+            loc.holder.insert(loc.key, node)
+            raise
+        holder.insert(idx, node)
+        self.mark(nid)
+        self.summary.append(f"move {nid}")
+
+    def op_replace(self, op: dict) -> None:
+        nid = op.get("id")
+        loc = self.d.find(nid)
+        new = op.get("node")
+        if isinstance(new, dict) and "id" not in new:
+            new = dict(new)
+            new["id"] = nid
+        node = self.new_node(new, loc.ancestors[-1] if loc.ancestors else loc.screen)
+        loc.holder[loc.key] = node
+        self.mark(node["id"])
+        self.summary.append(f"replace {nid}")
+
+    def op_wrap(self, op: dict) -> None:
+        ids = op.get("ids") or ([op["id"]] if "id" in op else [])
+        if not isinstance(ids, list) or not ids:
+            raise UIError("needs \"ids\": [...]")
+        locs = [self.d.find(i) for i in ids]
+        holder = locs[0].holder
+        if not locs[0].in_list or any(l.holder is not holder for l in locs):
+            raise UIError("all ids must be siblings in the same container")
+        spec = op.get("node") or {"type": "hstack"}
+        if not isinstance(spec, dict):
+            raise UIError("\"node\" must be an object")
+        if spec.get("type") not in HAS_CHILDREN - {"button"} and spec.get("type") not in TYPE_ALIASES:
+            raise UIError(f"wrap needs a container node (vstack/hstack/zstack/scroll/grid/list/section), got {compact(spec.get('type'))}")
+        positions = sorted(l.key for l in locs)
+        members = [holder[p] for p in positions]
+        container = dict(spec)
+        container.pop("children", None)
+        container = self.new_node(container, self.parent_id_of_slot(holder))
+        container["children"] = members
+        for p in reversed(positions):
+            del holder[p]
+        holder.insert(positions[0], container)
+        self.mark(container["id"])
+        self.summary.append(f"wrap {', '.join(ids)} in {container['id']} ({container.get('type')})")
+
+    def op_unwrap(self, op: dict) -> None:
+        nid = op.get("id")
+        loc = self.d.find(nid)
+        if not loc.in_list:
+            raise UIError(f"'{nid}' is a template or screen body; use replace")
+        kids = loc.node.get("children")
+        if not isinstance(kids, list):
+            raise UIError(f"'{nid}' has no children to unwrap")
+        loc.holder[loc.key:loc.key + 1] = kids
+        if loc.parent is not None:
+            self.mark(loc.parent.get("id"))
+        self.summary.append(f"unwrap {nid}")
+
+    def op_token(self, op: dict) -> None:
+        path = op.get("path")
+        if not isinstance(path, str):
+            raise UIError("needs \"path\" like \"colors.primary\"")
+        if path.startswith("tokens."):
+            path = path[7:]
+        set_path(self.d.tokens, path, op.get("value"), "token")
+        self.mark(f"tokens.{path}")
+        self.summary.append(f"token {path} = {compact(op.get('value'))}")
+
+    def op_screen(self, op: dict) -> None:
+        sid = op.get("id")
+        spec = op.get("spec")
+        if not isinstance(sid, str) or not ID_RE.match(sid):
+            raise UIError("needs a screen \"id\" (letters, digits, -, _)")
+        if spec is None:
+            if sid in self.d.screens:
+                del self.d.screens[sid]
+                self.summary.append(f"delete screen {sid}")
+                return
+            raise UIError(f"screen '{sid}' does not exist")
+        if not isinstance(spec, dict):
+            raise UIError("\"spec\" must be a screen object")
+        spec = copy.deepcopy(spec)
+        spec["id"] = sid
+        if sid in self.d.screens:
+            # replacing a screen: its old ids are free again
+            for loc in list(self.d.walk()):
+                if loc.screen == sid and loc.node.get("id") in self.fixer.taken:
+                    self.fixer.taken.discard(loc.node.get("id"))
+        body = spec.get("body")
+        if isinstance(body, dict):
+            self.fixer.fix_tree(body, sid)
+        elif isinstance(body, list):
+            for n in body:
+                self.fixer.fix_tree(n, sid)
+        if isinstance(spec.get("toolbar"), list):
+            for n in spec["toolbar"]:
+                self.fixer.fix_tree(n, sid)
+        existed = sid in self.d.screens
+        self.d.screens[sid] = spec
+        self.mark(sid)
+        self.summary.append(f"{'replace' if existed else 'new'} screen {sid}")
+
+    def op_nudge(self, op: dict) -> None:
+        nid = op.get("id")
+        prop = op.get("prop")
+        by = op.get("by", 1)
+        if prop not in NUDGE_PROPS:
+            raise UIError(f"prop must be one of {', '.join(NUDGE_PROPS)}")
+        if not isinstance(by, int) or isinstance(by, bool) or by == 0:
+            raise UIError("by must be a non-zero integer (steps)")
+        loc = self.d.find(nid)
+        value = nudge_value(self.d, loc.node, prop, by)
+        if isinstance(value, tuple) and value[0] == "controlSize":
+            loc.node["controlSize"] = value[1]
+            change = f"controlSize → {value[1]}"
+        elif isinstance(value, tuple) and value[0] == "frame":
+            loc.node.update(value[1])
+            change = " ".join(f"{k} → {v}" for k, v in value[1].items())
+        else:
+            old = loc.node.get(prop)
+            loc.node[prop] = value
+            change = f"{prop} {compact(old) + '→' if old is not None else '→ '}{compact(value)}"
+        self.mark(nid)
+        self.summary.append(f"nudge {nid} {change}")
+
+    def op_data(self, op: dict) -> None:
+        sid = op.get("screen")
+        if sid not in self.d.screens:
+            raise UIError(f"needs \"screen\": one of {', '.join(sorted(self.d.screens))}")
+        path = op.get("path")
+        if not isinstance(path, str) or not path:
+            raise UIError("needs \"path\" inside the screen's data, e.g. \"stories.0.title\"")
+        if path.startswith("data."):
+            path = path[5:]
+        data = self.d.screens[sid].setdefault("data", {})
+        set_path(data, path, op.get("value"), "data")
+        self.mark(sid)
+        self.summary.append(f"data {sid}.{path} = {compact(op.get('value'))[:60]}")
+
+    def op_path(self, op: dict) -> None:
+        f = op.get("file")
+        path = op.get("path")
+        if f in ("app", "app.json"):
+            root = self.d.app
+        elif f in ("tokens", "tokens.json"):
+            root = self.d.tokens
+        elif isinstance(f, str):
+            sid = f.replace("screens/", "").replace(".json", "")
+            if sid not in self.d.screens:
+                raise UIError(f"no screen '{sid}'.{suggest(sid, self.d.screens)}")
+            root = self.d.screens[sid]
+        else:
+            raise UIError("needs \"file\": \"app\" | \"tokens\" | \"screens/<id>\"")
+        set_path(root, path, op.get("value"), "path")
+        self.mark(f"{f}:{path}")
+        self.summary.append(f"path {f}:{path} = {compact(op.get('value'))[:60]}")
+
+
+def step_scale(scale: list, current: float, by: int) -> float:
+    """Moves `by` steps along a sorted scale from the nearest point to `current`."""
+    if by > 0:
+        bigger = [v for v in scale if v > current + 1e-9]
+        return bigger[min(by, len(bigger)) - 1] if bigger else scale[-1]
+    smaller = [v for v in scale if v < current - 1e-9]
+    return smaller[-min(-by, len(smaller))] if smaller else scale[0]
+
+
+def nudge_value(design: Design, node: dict, prop: str, by: int):
+    """Next value for a relative change ("bigger", "more space"), on the design's own scales."""
+    tokens = design.tokens if isinstance(design.tokens, dict) else {}
+    styles = tokens.get("styles") if isinstance(tokens.get("styles"), dict) else {}
+    style = styles.get(str(node.get("style", "")).lstrip("$"), {}) if node.get("style") else {}
+    cur = node.get(prop, style.get(prop) if isinstance(style, dict) else None)
+    if prop == "size" and node.get("type") == "button":
+        ladder = ["mini", "small", "regular", "large", "extraLarge"]
+        c = node.get("controlSize") if node.get("controlSize") in ladder else "regular"
+        return ("controlSize", ladder[max(0, min(len(ladder) - 1, ladder.index(c) + by))])
+    if prop == "size" and node.get("type") == "image" and "symbol" not in node:
+        w, h = node.get("width"), node.get("height")
+        if not isinstance(w, (int, float)) and not isinstance(h, (int, float)):
+            raise UIError("image has no width/height to scale; set them first")
+        out = {}
+        for key, val in (("width", w), ("height", h)):
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                out[key] = max(1, round(val * (1.25 ** by)))
+        return ("frame", out)
+    if prop == "size":
+        size = cur if isinstance(cur, (int, float)) and not isinstance(cur, bool) else None
+        if size is None:
+            font = node.get("font", style.get("font") if isinstance(style, dict) else None)
+            if isinstance(font, str) and font.startswith("$"):
+                font = (tokens.get("fonts") or {}).get(font[1:])
+            if isinstance(font, dict) and isinstance(font.get("size"), (int, float)):
+                size = font["size"]
+            elif isinstance(font, str):
+                size = TEXT_STYLE_SIZES.get(font, 17)
+            else:
+                size = 17
+        return step_scale(TYPE_SCALE, float(size), by)
+    if prop in ("padding", "spacing", "radius"):
+        group = (tokens.get("radius") if prop == "radius" else tokens.get("spacing")) or {}
+        named = sorted(((v, k) for k, v in group.items() if isinstance(v, (int, float)) and v < 500))
+        if isinstance(cur, dict):
+            raise UIError(f"{prop} is per-edge here; use set")
+        value = None
+        if isinstance(cur, str) and cur.startswith("$"):
+            value = group.get(cur[1:])
+        elif isinstance(cur, (int, float)) and not isinstance(cur, bool):
+            value = cur
+        if not named:
+            return max(0, (value or 0) + 4 * by)
+        scale = [v for v, _ in named]
+        if value is None:
+            value = scale[0] - 1 if by > 0 else scale[0]
+        target = step_scale(scale, float(value), by)
+        return "$" + dict((v, k) for v, k in named)[target]
+    if prop == "weight":
+        w = cur if cur in WEIGHT_ORDER else "regular"
+        i = max(0, min(len(WEIGHT_ORDER) - 1, WEIGHT_ORDER.index(w) + by))
+        return WEIGHT_ORDER[i]
+    if prop == "opacity":
+        o = cur if isinstance(cur, (int, float)) and not isinstance(cur, bool) else 1.0
+        return round(max(0.0, min(1.0, o + 0.1 * by)), 2)
+    if prop in ("width", "height"):
+        if not isinstance(cur, (int, float)) or isinstance(cur, bool):
+            raise UIError(f"{prop} has no numeric value to nudge; use set")
+        return max(1, round(cur * (1.15 ** by)))
+    raise UIError(f"cannot nudge '{prop}' (use one of {', '.join(NUDGE_PROPS)})")
+
+
+def subtree_ids(node) -> set:
+    out = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, dict):
+            if isinstance(n.get("id"), str):
+                out.add(n["id"])
+            stack.extend(n.get("children") or [])
+            if isinstance(n.get("template"), dict):
+                stack.append(n["template"])
+    return out
+
+
+# --------------------------------------------------------------------------
+# Live channel: rev, status, snapshots, history
+# --------------------------------------------------------------------------
+
+
+class Live:
+    def __init__(self, project: Project):
+        self.p = project
+        self.dir = project.live
+
+    def read(self, name: str):
+        try:
+            return read_json(self.dir / name)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def bump_rev(self, changed: list, quiet: bool = False) -> int:
+        """Written after the design files; the app reloads and echoes `rev` in status.json.
+        `quiet` skips the orange change outline (used when a screenshot follows)."""
+        cur = self.read("rev") or {}
+        rev = int(cur.get("rev", 0)) + 1
+        write_atomic(self.dir / "rev", compact({"rev": rev, "changed": changed, "quiet": quiet, "at": time.time()}))
+        return rev
+
+    def status(self):
+        return self.read("status.json")
+
+    def app_alive(self, status=None) -> bool:
+        status = status if status is not None else self.status()
+        if not status or not isinstance(status.get("pid"), int):
+            return False
+        try:
+            os.kill(status["pid"], 0)
+            return True
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+    def wait_rev(self, rev: int, timeout: float = 2.5):
+        """Waits until the app reports it applied `rev`. Returns (status|None, seconds)."""
+        t0 = time.time()
+        status = self.status()
+        if not self.app_alive(status):
+            return None, 0.0
+        while time.time() - t0 < timeout:
+            status = self.status()
+            if status and int(status.get("rev", 0)) >= rev:
+                return status, time.time() - t0
+            time.sleep(0.025)
+        return False, time.time() - t0
+
+    # snapshots (undo) -----------------------------------------------------
+
+    def snapshot(self, texts: dict, label: str) -> None:
+        hist = self.dir / "history"
+        hist.mkdir(parents=True, exist_ok=True)
+        existing = sorted(int(p.name) for p in hist.iterdir() if p.name.isdigit())
+        n = (existing[-1] + 1) if existing else 1
+        target = hist / str(n)
+        for name, text in texts.items():
+            write_atomic(target / name, text)
+        write_atomic(target / ".label", label)
+        for old in existing[:-99]:
+            shutil.rmtree(hist / str(old), ignore_errors=True)
+
+    def latest_snapshot(self):
+        hist = self.dir / "history"
+        if not hist.is_dir():
+            return None
+        existing = sorted(int(p.name) for p in hist.iterdir() if p.name.isdigit())
+        return hist / str(existing[-1]) if existing else None
+
+    def log(self, entry: dict) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with (self.dir / "history.jsonl").open("a", encoding="utf-8") as f:
+            f.write(compact(entry) + "\n")
+
+    def timing(self, entry: dict) -> None:
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            with (self.dir / "timings.jsonl").open("a", encoding="utf-8") as f:
+                f.write(compact(dict(entry, at=round(time.time(), 3))) + "\n")
+        except OSError:
+            pass
+
+    def recent(self, n: int = 3) -> list:
+        path = self.dir / "history.jsonl"
+        if not path.exists():
+            return []
+        lines = path.read_text(encoding="utf-8").splitlines()[-n:]
+        out = []
+        for line in lines:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        return out
+
+
+def restore_texts(project: Project, texts: dict) -> None:
+    design = project.design
+    current = {str(p.relative_to(design)) for p in design.rglob("*.json")}
+    for name, text in texts.items():
+        write_atomic(design / name, text)
+    for name in current - set(texts):
+        if name.startswith("screens/"):
+            (design / name).unlink()
+
+
+def write_design(project: Project, design: Design) -> list:
+    changes = design.changed_files()
+    for name, text in changes["write"].items():
+        write_atomic(project.design / name, text)
+    for name in changes["remove"]:
+        try:
+            (project.design / name).unlink()
+        except FileNotFoundError:
+            pass
+    return list(changes["write"]) + changes["remove"]
+
+
+def privacy_hint(root: Path) -> str:
+    home = Path.home()
+    for name in ("Documents", "Desktop", "Downloads"):
+        try:
+            root.relative_to(home / name)
+            return (f" The project is inside ~/{name}; macOS privacy rules can stop the Simulator from reading it. "
+                    f"Move it to e.g. ~/Code.")
+        except ValueError:
+            continue
+    return ""
+
+
+# --------------------------------------------------------------------------
+# Apply pipeline (shared by apply / ask / undo / variants)
+# --------------------------------------------------------------------------
+
+
+def run_ops(project: Project, ops: list, note: str = "", wait: bool = True, shot: bool = False,
+            quiet: bool = False, record: bool = True, start_texts=None, snapshot: bool = True) -> dict:
+    """Validate + apply ops in memory, write changed files atomically, bump the rev
+    and wait for the app to confirm. `start_texts` applies the ops on top of that
+    content instead of the files on disk (used to switch variants in one write)."""
+    t0 = time.time()
+    with project_lock(project):
+        return _run_ops_locked(project, ops, note, wait, shot, quiet, record, start_texts, snapshot, t0)
+
+
+class project_lock:
+    """Serializes applies (a person and a model, or parallel variants) via flock."""
+
+    def __init__(self, project: Project):
+        self.path = project.live / "lock"
+        self.fh = None
+
+    def __enter__(self):
+        try:
+            import fcntl
+
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.fh = self.path.open("w")
+            fcntl.flock(self.fh, fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            self.fh = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.fh is not None:
+            self.fh.close()
+
+
+def _run_ops_locked(project, ops, note, wait, shot, quiet, record, start_texts, snapshot, t0) -> dict:
+    design = Design(project)
+    if design.load_errors:
+        raise UIError("design files are broken, fix them first:\n  " + "\n  ".join(design.load_errors))
+    before = design.snapshot_texts()
+    if start_texts is not None:
+        design.load_texts(start_texts)
+    applier = Applier(design)
+    applier.apply_all(ops)
+    v = Validator(design).run()
+    if v.errors:
+        raise UIError("rejected, nothing was written:\n  " + "\n  ".join(v.errors[:12]) +
+                      (f"\n  … {len(v.errors) - 12} more" if len(v.errors) > 12 else ""))
+    live = Live(project)
+    files = []
+    pending = design.changed_files()
+    if pending["write"] or pending["remove"]:
+        if snapshot:
+            live.snapshot(before, note or ", ".join(applier.summary)[:200])
+        files = write_design(project, design)
+    rev = live.bump_rev(applier.changed, quiet=shot)
+    write_ms = (time.time() - t0) * 1000
+    if record:
+        live.log({"at": time.time(), "request": note, "ops": applier.summary, "changed": applier.changed})
+    result = {"summary": applier.summary, "changed": applier.changed, "notes": applier.fixer.notes,
+              "warnings": v.warnings, "files": files, "rev": rev, "write_ms": write_ms, "status": None}
+    if wait:
+        status, secs = live.wait_rev(rev)
+        result["status"] = status
+        result["render_s"] = secs
+    st = result.get("status")
+    write_atomic(live.dir / "last-apply.json", compact({
+        "at": time.time(), "say": note, "summary": applier.summary[:8], "notes": applier.fixer.notes[:6],
+        "warnings": v.warnings[:4], "screen": st.get("screen") if isinstance(st, dict) else None,
+        "app": "live" if isinstance(st, dict) else ("down" if st is None else "unconfirmed"),
+        "error": st.get("error") if isinstance(st, dict) else None,
+        "seconds": round(write_ms / 1000 + (result.get("render_s") or 0), 2)}))
+    if shot and result.get("status"):
+        time.sleep(0.35)  # let the 0.25 s change animation finish
+        result["shot"] = take_screenshot(project)
+    if not quiet:
+        print_result(project, result)
+    return result
+
+
+def print_result(project: Project, r: dict) -> None:
+    what = "; ".join(r["summary"]) or "no changes"
+    print(f"ok  {what}")
+    for n in r["notes"]:
+        print(f"    auto-fixed {n}")
+    for w in r["warnings"][:5]:
+        print(f"    note: {w}")
+    st = r.get("status")
+    if st is None and "render_s" in r:
+        print(f"    app not running — files saved; start it with ./run.sh.{privacy_hint(project.root)}")
+    elif st is False:
+        print(f"    saved, but the app didn't confirm within {r['render_s']:.1f}s.{privacy_hint(project.root)}")
+    elif isinstance(st, dict):
+        err = st.get("error")
+        if err:
+            print(f"    app reports a design error: {err}")
+        else:
+            print(f"    live on '{st.get('screen')}' in {r['write_ms'] / 1000 + r['render_s']:.2f}s")
+    if r.get("shot"):
+        print(f"    screenshot: {r['shot']}")
+
+
+def take_screenshot(project: Project, path=None, small: bool = False) -> str:
+    out = Path(path) if path else project.live / "shot.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    device = "booted"
+    dev_file = project.live / "device"
+    if dev_file.exists():
+        device = dev_file.read_text().strip() or "booted"
+    try:
+        subprocess.run(["xcrun", "simctl", "io", device, "screenshot", str(out)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=20)
+    except FileNotFoundError:
+        raise UIError("xcrun not found (screenshots need Xcode on this Mac)")
+    except subprocess.CalledProcessError as e:
+        raise UIError(f"screenshot failed: {e.stderr.decode(errors='replace').strip()}")
+    except subprocess.TimeoutExpired:
+        raise UIError("screenshot timed out (is the Simulator window open?)")
+    if small and shutil.which("sips"):
+        jpg = out.with_suffix(".jpg")
+        done = subprocess.run(["sips", "-Z", "900", "-s", "format", "jpeg", "-s", "formatOptions", "70",
+                               str(out), "--out", str(jpg)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if done.returncode == 0:
+            return str(jpg)
+    return str(out)
+
+
+# --------------------------------------------------------------------------
+# Context (what a model reads instead of the codebase)
+# --------------------------------------------------------------------------
+
+PROP_ORDER = ["text", "symbol", "url", "asset", "name", "items", "variant", "style", "action", "onTap", "bind",
+              "placeholder", "options", "header", "footer", "visibleIf"]
+
+
+def fmt_value(v, limit: int = 70) -> str:
+    if isinstance(v, str):
+        s = v if len(v) <= limit else v[:limit - 1] + "…"
+        return json.dumps(s, ensure_ascii=False)
+    s = compact(v)
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def fmt_props(node: dict) -> str:
+    keys = [k for k in PROP_ORDER if k in node] + sorted(k for k in node if k not in PROP_ORDER and k not in STRUCTURAL)
+    # actions are shown in full: a model may copy them back
+    return " ".join(f"{k}={compact(node[k]) if k in ('action', 'onTap') else fmt_value(node[k])}" for k in keys)
+
+
+def outline(node, depth: int = 0, lines=None, data=None) -> list:
+    lines = [] if lines is None else lines
+    if not isinstance(node, dict):
+        return lines
+    pad = "  " * depth
+    t = node.get("type", "?")
+    extra = ""
+    if t == "repeat" and isinstance(node.get("items"), str) and data is not None:
+        items = resolve_path(data, node["items"].lstrip("$").replace("data.", "", 1))
+        if isinstance(items, list):
+            extra = f"  ({len(items)} items)"
+    lines.append(f"{pad}{node.get('id', '(no id)')} {t} {fmt_props(node)}{extra}".rstrip())
+    for c in node.get("children") or []:
+        outline(c, depth + 1, lines, data)
+    if isinstance(node.get("template"), dict):
+        lines.append(f"{pad}  template:")
+        outline(node["template"], depth + 2, lines, data)
+    return lines
+
+
+def tokens_summary(tokens: dict) -> list:
+    out = []
+    for group in ("colors", "colorsDark", "fonts", "spacing", "radius", "shadows", "styles"):
+        g = tokens.get(group)
+        if not isinstance(g, dict) or not g:
+            continue
+        if group == "fonts":
+            parts = []
+            for k, v in g.items():
+                if isinstance(v, dict):
+                    parts.append(f"{k}={'/'.join(str(v[x]) for x in ('size', 'weight', 'design') if x in v)}")
+                else:
+                    parts.append(f"{k}={v}")
+            out.append(f"fonts: {' '.join(parts)}")
+        elif group in ("shadows",):
+            out.append(f"shadows: {' '.join(g)}")
+        elif group == "styles":
+            out.append("styles: " + " ".join(f"{k}={compact(v)}" for k, v in g.items()))
+        else:
+            out.append(f"{group}: " + " ".join(f"{k}={v}" for k, v in g.items()))
+    return out
+
+
+def mentions(design: Design, screen: str, request: str) -> list:
+    """Quoted or on-screen text named in the request -> ids (saves the model a guess)."""
+    if not request:
+        return []
+    wanted = [q.strip() for q in re.findall(r"[\"“'‘]([^\"”'’]{2,60})[\"”'’]", request)]
+    low = request.lower()
+    out = []
+    for loc in design.walk():
+        if loc.screen != screen:
+            continue
+        n = loc.node
+        for k in ("text", "header", "placeholder"):
+            v = n.get(k)
+            if not isinstance(v, str) or "{{" in v or len(v) < 3:
+                continue
+            hit = any(w.lower() in v.lower() for w in wanted) or v.lower() in low
+            if hit and n.get("id"):
+                out.append(f"\"{v[:40]}\" → {n['id']}")
+    return out[:6]
+
+
+def build_context(project: Project, screen: str = None, request: str = "") -> str:
+    d = Design(project)
+    live = Live(project)
+    status = live.status() or {}
+    alive = live.app_alive(status)
+    current = screen or (status.get("screen") if alive else None) or d.default_screen()
+    if current not in d.screens:
+        current = d.default_screen()
+    L = []
+    if d.load_errors:
+        L.append("!! design files have errors: " + "; ".join(d.load_errors))
+    tabs = d.app.get("tabs")
+    nav = ""
+    if isinstance(tabs, list):
+        nav = "tabs: " + ", ".join(f"{t.get('id')}→{t.get('screen', t.get('id'))}" for t in tabs if isinstance(t, dict))
+    elif d.app.get("root"):
+        nav = f"root: {d.app.get('root')}"
+    L.append(f"# app {d.app.get('name', '')}  ({nav})")
+    if alive:
+        stack = " › ".join(status.get("stack") or [])
+        L.append(f"# simulator: showing '{status.get('screen')}'  stack: {stack}")
+        if status.get("error"):
+            L.append(f"# app design error: {status['error']}")
+    else:
+        L.append("# simulator: app not running")
+    sel = live.read("selection.json")
+    idx = d.index()
+    recent = live.recent(1)
+    last_at = float(recent[-1].get("at", 0)) if recent else 0
+    focus = None
+    if sel and sel.get("id") in idx and time.time() - float(sel.get("at", 0)) < 1800:
+        loc = idx[sel["id"]]
+        chain = " ‹ ".join(reversed(loc.ancestors)) if loc.ancestors else loc.screen
+        L.append(f"# picked in the simulator: {sel['id']}  inside: {chain}")
+        if isinstance(sel.get("row"), int):
+            rep_id = next((a for a in reversed(loc.ancestors) if idx.get(a) and idx[a].node.get("type") == "repeat"), None)
+            if rep_id:
+                items = idx[rep_id].node.get("items")
+                L.append(f"#   this is the TEMPLATE of repeat {rep_id} (row {sel['row'] + 1}; that row's content is "
+                         f"{items}.{sel['row']}). Edit the template to change every row, data to change one row.")
+        L.append(f"#   {compact(loc.node)[:600]}")
+        if float(sel.get("at", 0)) > last_at:
+            focus = sel["id"]
+    if focus is None and recent:
+        changed = [c for c in recent[-1].get("changed", []) if c in idx]
+        if changed:
+            focus = ", ".join(changed[:3]) + "  (last edited)"
+    if focus:
+        L.append(f"# FOCUS (\"this/it\"): {focus}")
+    found = mentions(d, current, request)
+    if found:
+        L.append("# request mentions: " + "; ".join(found))
+    L.append("")
+    L.append(f"## screen {current}  (design/screens/{current}.json)")
+    s = d.screens.get(current, {})
+    head = {k: v for k, v in s.items() if k not in ("body", "data", "toolbar", "id")}
+    if head:
+        L.append("screen props: " + " ".join(f"{k}={fmt_value(v)}" for k, v in head.items()))
+    if isinstance(s.get("data"), dict) and s["data"]:
+        for k, v in s["data"].items():
+            if isinstance(v, list):
+                first = compact(v[0])[:160] if v else ""
+                L.append(f"data.{k}: {len(v)} items, e.g. {first}")
+            else:
+                L.append(f"data.{k}: {fmt_value(v, 120)}")
+    for item in s.get("toolbar") or []:
+        L.append(f"toolbar ({current}.toolbar): {item.get('id')} {item.get('type')} {fmt_props(item)}")
+    body = s.get("body")
+    if isinstance(body, list):
+        for n in body:
+            outline(n, 0, L, s.get("data"))
+    else:
+        outline(body, 0, L, s.get("data"))
+    L.append("")
+    L.append("## tokens (design/tokens.json)")
+    L.extend(tokens_summary(d.tokens))
+    if isinstance(d.app.get("state"), dict) and d.app["state"]:
+        L.append("state: " + " ".join(f"{k}={fmt_value(v, 30)}" for k, v in d.app["state"].items()))
+    L.append("")
+    others = [sid for sid in sorted(d.screens) if sid != current]
+    if others:
+        blocks = []
+        for sid in others:
+            sc = d.screens[sid]
+            lines = [f"### {sid}  title={fmt_value(sc.get('title', ''), 40)}"]
+            for item in sc.get("toolbar") or []:
+                lines.append(f"toolbar ({sid}.toolbar): {item.get('id')} {item.get('type')} {fmt_props(item)}")
+            body = sc.get("body")
+            for n in (body if isinstance(body, list) else [body]):
+                outline(n, 0, lines, sc.get("data"))
+            blocks.append(lines)
+        if sum(len(x) for b in blocks for x in b) < 14000:  # small app: show everything
+            L.append("## other screens")
+            for b in blocks:
+                L.extend(b)
+        else:
+            L.append("## other screens (ids only; use ./ui context --screen <id> for detail)")
+            for sid in others:
+                sc = d.screens[sid]
+                ids = [loc.node.get("id") for loc in d.walk() if loc.screen == sid][:25]
+                L.append(f"{sid}: title={fmt_value(sc.get('title', ''), 40)} ids: {' '.join(i for i in ids if i)}")
+    comps = (status or {}).get("components") if alive else None
+    if isinstance(comps, dict) and comps:
+        L.append("")
+        L.append("## custom components (use {\"type\":\"custom\",\"name\":...})")
+        for name, doc in sorted(comps.items()):
+            L.append(f"{name}: {doc}")
+    hist = live.recent(3)
+    if hist:
+        L.append("")
+        L.append("## recent edits (newest last)")
+        for h in hist:
+            req = f"\"{h.get('request')}\" → " if h.get("request") else ""
+            L.append(f"- {req}{'; '.join(h.get('ops', []))[:200]}")
+    return "\n".join(L)
+
+
+# --------------------------------------------------------------------------
+# Model backends (ask / chat)
+# --------------------------------------------------------------------------
+
+SYSTEM_RULES = """You edit the UI of a SwiftUI prototype app. The UI is JSON (design/*.json) and the
+running app hot-reloads it. You never write Swift. You answer with ONE JSON object and nothing else:
+
+  {"say": "<= 12 words: what you will change", "ops": [ ...ops... ]}
+
+Rules:
+- Use only the ops, node types and props in the reference below. Ids you reference must exist in
+  the context. New nodes may omit "id".
+- Pick the narrowest op. A change to "all buttons/cards/the brand" is a token or style edit. A change
+  to one element is a "set". Layout changes use wrap/move/insert/unwrap.
+- "it", "this", "that" mean the FOCUS element in the context; otherwise the most likely element on the
+  screen being shown (say which one you picked).
+- Scope: one element → set/nudge; "all cards/buttons" → its style (token op on styles.*); brand/theme →
+  a color token. Relative requests (bigger, more, less, again) → nudge.
+- Stay consistent with the design tokens; prefer $tokens over raw values; add a token when introducing
+  a new brand color.
+- If the request cannot be done with these tools, return {"ops": [], "say": "<why, and what Swift
+  component would be needed>"}.
+"""
+
+VARIANTS_RULES = """Return {N} clearly different design directions as:
+  {"variants": [{"name": "<2-4 words>", "ops": [...]}, ...]}
+Each variant must be a complete, independent set of ops applied to the CURRENT design (not cumulative)."""
+
+
+def system_prompt(project: Project) -> str:
+    ref = project.reference.read_text(encoding="utf-8") if project.reference.exists() else ""
+    return SYSTEM_RULES + "\n\n# Reference\n\n" + ref
+
+
+def user_prompt(context: str, request: str, variants: int) -> str:
+    tail = VARIANTS_RULES.replace("{N}", str(variants)) if variants > 1 else ""
+    return f"<context>\n{context}\n</context>\n\nRequest: {request}\n{tail}".rstrip()
+
+
+class Backend:
+    name = "?"
+    model = ""
+    last_usage: dict = {}
+
+    def warm(self, system: str) -> None:
+        pass
+
+    def complete(self, system: str, messages: list, max_tokens: int) -> str:
+        raise NotImplementedError
+
+
+class APIBackend(Backend):
+    """Official anthropic SDK. One client per process so chat reuses the connection."""
+
+    name = "api"
+
+    def __init__(self, model: str, think: bool):
+        import anthropic  # noqa: F401  (ImportError handled by caller)
+
+        self.anthropic = anthropic
+        self.client = anthropic.Anthropic(max_retries=1, timeout=60.0)
+        self.model = model
+        self.think = think
+        self.last_usage = {}
+
+    def _kwargs(self, system: str, messages: list, max_tokens: int) -> dict:
+        kwargs = dict(
+            model=self.model,
+            max_tokens=max_tokens,
+            # Static prefix (rules + reference) is cached; the context/request follow it.
+            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+            messages=messages,
+        )
+        if self.think:
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = {"effort": "medium"}
+        elif "haiku" in self.model:
+            # Thinking off + low effort: the fastest time-to-first-op for small edits.
+            kwargs["thinking"] = {"type": "disabled"}
+            kwargs["output_config"] = {"effort": "low"}
+        else:
+            # Larger models: thinking can't always be disabled; low effort keeps it short.
+            kwargs["output_config"] = {"effort": "low"}
+        return kwargs
+
+    def warm(self, system: str) -> None:
+        """Pre-writes the prompt cache (max_tokens=0) so the first real request is fast."""
+        try:
+            self.client.messages.create(**self._kwargs(system, [{"role": "user", "content": "warmup"}], 0))
+        except Exception:  # best effort
+            pass
+
+    def complete(self, system: str, messages: list, max_tokens: int) -> str:
+        a = self.anthropic
+        kwargs = self._kwargs(system, messages, max_tokens)
+        try:
+            resp = self.client.messages.create(**kwargs)
+        except a.AuthenticationError:
+            raise UIError("Claude API rejected the credentials. Set ANTHROPIC_API_KEY (or run `ant auth login`), "
+                          "or use UI_BACKEND=claude to go through Claude Code.")
+        except a.RateLimitError:
+            raise UIError("Claude API rate limit hit; try again in a moment.")
+        except a.BadRequestError as e:
+            raise UIError(f"Claude API rejected the request: {e.message}")
+        except a.APIStatusError as e:
+            raise UIError(f"Claude API error {e.status_code}: {e.message}")
+        except a.APIConnectionError:
+            raise UIError("cannot reach the Claude API (network?)")
+        except a.AnthropicError as e:
+            raise UIError(f"Claude API client error: {e}. Set ANTHROPIC_API_KEY or use UI_BACKEND=claude.")
+        except TypeError as e:
+            raise UIError(f"the installed anthropic SDK is too old ({e}); install uv (`brew install uv`) "
+                          f"so ./ui can run with a current SDK")
+        u = getattr(resp, "usage", None)
+        if u is not None:
+            self.last_usage = {"in": getattr(u, "input_tokens", 0), "out": getattr(u, "output_tokens", 0),
+                               "cache_read": getattr(u, "cache_read_input_tokens", 0) or 0}
+        if resp.stop_reason == "refusal":
+            raise UIError("the model declined this request")
+        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        if resp.stop_reason == "max_tokens":
+            raise UIError("the model ran out of output tokens; ask for a smaller change")
+        return text
+
+
+class ClaudeCLIBackend(Backend):
+    """Falls back to Claude Code's headless mode (uses your Claude Code login)."""
+
+    name = "claude-cli"
+
+    def __init__(self, project: Project, model: str):
+        self.project = project
+        self.model = "haiku" if model == DEFAULT_MODEL else model
+
+    def complete(self, system: str, messages: list, max_tokens: int) -> str:
+        sys_file = self.project.live / "ask-system.md"
+        write_atomic(sys_file, system)
+        prompt = "\n\n".join(
+            (m["content"] if m["role"] == "user" else f"(your previous answer)\n{m['content']}") for m in messages
+        )
+        cmd = ["claude", "-p", "--model", self.model, "--output-format", "json", "--tools", "",
+               "--system-prompt-file", str(sys_file)]
+        try:
+            proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=120,
+                                  cwd=str(self.project.root))
+        except FileNotFoundError:
+            raise UIError("`claude` not found on PATH")
+        except subprocess.TimeoutExpired:
+            raise UIError("claude -p timed out")
+        if proc.returncode != 0:
+            raise UIError(f"claude -p failed: {(proc.stderr or proc.stdout).strip()[:400]}")
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return proc.stdout
+        return data.get("result") or ""
+
+
+def make_backend(project: Project, model: str, think: bool) -> Backend:
+    choice = os.environ.get("UI_BACKEND", "").lower()
+    if choice in ("claude", "cli", "claude-cli"):
+        return ClaudeCLIBackend(project, model)
+    if choice == "api" or _has_api_credentials() or not shutil.which("claude"):
+        try:
+            return APIBackend(model, think)
+        except ImportError:
+            pass
+    if choice != "api" and not os.environ.get("UI_NO_UV") and shutil.which("uv") and _has_api_credentials():
+        # Re-run this script with the anthropic SDK available (uv caches the env).
+        env = dict(os.environ, UI_NO_UV="1")
+        os.execvpe("uv", ["uv", "run", "--quiet", "--script", str(Path(__file__).resolve())] + sys.argv[1:], env)
+    if shutil.which("claude"):
+        print("note: no API key/SDK — using `claude -p` (slower: CLI startup + large prompt). "
+              "For the fast path set ANTHROPIC_API_KEY and install uv, or use /ui inside Claude Code.", file=sys.stderr)
+        return ClaudeCLIBackend(project, model)
+    raise UIError("no model backend: install uv (`brew install uv`) and set ANTHROPIC_API_KEY, "
+                  "`pip3 install anthropic`, or install Claude Code (`claude`).")
+
+
+def _has_api_credentials() -> bool:
+    if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        return True
+    return (Path.home() / ".config" / "anthropic").exists()
+
+
+VARIANT_DIRECTIONS = [
+    "a refined, conservative take that stays close to the current design",
+    "a bolder take: stronger color, contrast and type hierarchy",
+    "a different arrangement or layout of the same content",
+    "a minimal, airy take with more whitespace and fewer accents",
+    "a playful take with rounder shapes and warmer color",
+]
+
+
+def request_ops(project: Project, backend: Backend, context: str, system: str, request: str,
+                retries: int = 1):
+    """One model round trip (plus one corrective retry): returns (ops, say, model_seconds)."""
+    t0 = time.time()
+    if not context:
+        context = build_context(project, request=request)
+    messages = [{"role": "user", "content": user_prompt(context, request, 1)}]
+    last_err = None
+    for attempt in range(retries + 1):
+        text = backend.complete(system, messages, 2048)
+        data = extract_json(text)
+        try:
+            if not isinstance(data, (dict, list)):
+                raise UIError("reply was not JSON")
+            ops = parse_ops(data)
+            dry_run(project, ops)
+            say = data.get("say", "") if isinstance(data, dict) else ""
+            return ops, say, time.time() - t0
+        except UIError as e:
+            last_err = e
+            if attempt >= retries:
+                break
+            messages.append({"role": "assistant", "content": text})
+            messages.append({"role": "user", "content": f"That failed: {e}\nReply with corrected JSON only."})
+    raise UIError(f"model ops failed: {last_err}")
+
+
+def ask(project: Project, backend: Backend, request: str, variants: int = 1, dry: bool = False,
+        shot: bool = False, retries: int = 1) -> dict:
+    context = build_context(project, request=request)
+    system = system_prompt(project)
+    live = Live(project)
+    if variants > 1:
+        return ask_variants(project, backend, context, system, request, variants, dry, shot)
+    ops, say, model_s = request_ops(project, backend, context, system, request, retries)
+    if not ops:
+        raise Escalate(say or "the model returned no ops")
+    if dry:
+        print(json.dumps(ops, indent=2, ensure_ascii=False))
+        return {"ops": ops}
+    res = run_ops(project, ops, note=request, shot=shot, quiet=True)
+    print(f"ok  {say or 'done'}")
+    print_result_short(project, res, model_s)
+    live.timing({"kind": "ask", "backend": backend.name, "model": backend.model, "model_s": round(model_s, 3),
+                 "write_s": round(res["write_ms"] / 1000, 3), "render_s": round(res.get("render_s") or 0, 3),
+                 "ops": len(ops), **{f"tok_{k}": v for k, v in (backend.last_usage or {}).items()}})
+    return res
+
+
+def ask_variants(project: Project, backend: Backend, context: str, system: str, request: str, n: int,
+                 dry: bool, shot: bool) -> dict:
+    """N parallel calls (one per design direction). The first valid one is shown at once;
+    the rest are staged for ./ui next as they arrive."""
+    n = max(2, min(n, len(VARIANT_DIRECTIONS)))
+    t0 = time.time()
+
+    def one(i: int):
+        hint = f"{request}\n\nDesign direction for this variant: {VARIANT_DIRECTIONS[i]}. Make it clearly distinct."
+        ops, say, secs = request_ops(project, backend, context, system, hint)
+        return {"name": say or VARIANT_DIRECTIONS[i].split(":")[0], "ops": ops, "seconds": round(secs, 2)}
+
+    got = []
+    failures = []
+    started = False
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+        futures = [pool.submit(one, i) for i in range(n)]
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                v = fut.result()
+            except UIError as e:
+                failures.append(str(e))
+                continue
+            if not v["ops"]:
+                failures.append(v["name"])
+                continue
+            got.append(v)
+            if dry:
+                continue
+            if not started:
+                start_variants(project, [v], request, time.time() - t0, shot)
+                started = True
+            else:
+                add_variant(project, v)
+    if dry:
+        print(json.dumps(got, indent=2, ensure_ascii=False))
+        return {"variants": got}
+    if not got:
+        raise UIError("no usable variants: " + "; ".join(failures[:3]))
+    Live(project).timing({"kind": "variants", "backend": backend.name, "model": backend.model, "n": n,
+                          "first_s": min(v["seconds"] for v in got), "all_s": round(time.time() - t0, 3)})
+    print(f"    {len(got)} variants ready ({time.time() - t0:.1f}s) — ./ui next | prev | keep")
+    return {"variants": got}
+
+
+def print_result_short(project: Project, r: dict, model_s: float) -> None:
+    print(f"    {'; '.join(r['summary'])}")
+    for n in r["notes"]:
+        print(f"    auto-fixed {n}")
+    st = r.get("status")
+    timing = f"model {model_s:.2f}s"
+    if isinstance(st, dict):
+        if st.get("error"):
+            print(f"    app reports a design error: {st['error']}")
+        timing += f" · live on '{st.get('screen')}' +{r['write_ms'] / 1000 + r.get('render_s', 0):.2f}s"
+    elif st is None:
+        timing += f" · app not running (./run.sh).{privacy_hint(project.root)}"
+    else:
+        timing += " · app didn't confirm"
+    print(f"    {timing}")
+    if r.get("shot"):
+        print(f"    screenshot: {r['shot']}")
+
+
+def dry_run(project: Project, ops: list) -> None:
+    design = Design(project)
+    Applier(design).apply_all(ops)
+    v = Validator(design).run()
+    if v.errors:
+        raise UIError("; ".join(v.errors[:8]))
+
+
+# variants ------------------------------------------------------------------
+
+
+def start_variants(project: Project, variants: list, request: str, model_s: float, shot: bool) -> dict:
+    base = Design(project).snapshot_texts()
+    live = Live(project)
+    write_atomic(live.dir / "variants.json", dump({"request": request, "base": base, "variants": variants, "current": -1}))
+    print(f"ok  first variant in {model_s:.2f}s")
+    return show_variant(project, 0, shot=shot)
+
+
+def add_variant(project: Project, variant: dict) -> None:
+    live = Live(project)
+    state = live.read("variants.json")
+    if not state:
+        return
+    state["variants"].append(variant)
+    write_atomic(live.dir / "variants.json", dump(state))
+    print(f"    + variant {len(state['variants'])}: {variant['name']}")
+
+
+def show_variant(project: Project, index: int, shot: bool = False) -> dict:
+    live = Live(project)
+    state = live.read("variants.json")
+    if not state:
+        raise UIError("no variants in progress (use ./ui ask -n 3 \"...\")")
+    vs = state["variants"]
+    index %= len(vs)
+    first = state.get("current", -1) == -1
+    var = vs[index]
+    note = f"{state['request']} [variant {index + 1}: {var['name']}]"
+    # Variants are always applied on top of the base design, in one write. Only
+    # the first one takes an undo snapshot, so one `undo` returns to the base.
+    res = run_ops(project, var["ops"], note=note, shot=shot, quiet=True, record=first,
+                  start_texts=state["base"], snapshot=first)
+    state["current"] = index
+    write_atomic(live.dir / "variants.json", dump(state))
+    st = res.get("status")
+    where = f" · live on '{st.get('screen')}'" if isinstance(st, dict) else ""
+    print(f"ok  variant {index + 1}/{len(vs)}: {var['name']}{where}")
+    if res.get("shot"):
+        print(f"    screenshot: {res['shot']}")
+    return res
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+
+def cmd_context(project: Project, args) -> int:
+    print(build_context(project, args.screen, args.request))
+    return 0
+
+
+def cmd_apply(project: Project, args) -> int:
+    raw = args.ops
+    if raw in (None, "-"):
+        raw = sys.stdin.read()
+    note = args.note or ""
+    if not note and isinstance(raw, str):
+        try:
+            env = json.loads(raw)
+            if isinstance(env, dict) and isinstance(env.get("say"), str):
+                note = env["say"]
+                if env.get("ops") == []:
+                    raise Escalate(note)
+        except json.JSONDecodeError:
+            pass
+    ops = parse_ops(raw)
+    res = run_ops(project, ops, note=note, wait=not args.no_wait, shot=args.shot)
+    Live(project).timing({"kind": "apply", "write_s": round(res["write_ms"] / 1000, 3),
+                          "render_s": round(res.get("render_s") or 0, 3), "ops": len(ops)})
+    return 0
+
+
+def cmd_undo(project: Project, args) -> int:
+    live = Live(project)
+    for _ in range(max(1, args.steps)):
+        snap = live.latest_snapshot()
+        if snap is None:
+            print("nothing to undo")
+            return 1
+        texts = {}
+        for p in snap.rglob("*.json"):
+            texts[str(p.relative_to(snap))] = p.read_text(encoding="utf-8")
+        label = (snap / ".label").read_text(encoding="utf-8") if (snap / ".label").exists() else ""
+        restore_texts(project, texts)
+        shutil.rmtree(snap, ignore_errors=True)
+        print(f"ok  undid: {label}")
+    try:
+        (live.dir / "variants.json").unlink()
+    except FileNotFoundError:
+        pass
+    rev = live.bump_rev([])
+    live.wait_rev(rev, 1.5)
+    return 0
+
+
+def cmd_pick(project: Project, args) -> int:
+    live = Live(project)
+    if not live.app_alive():
+        raise UIError(f"the app isn't running; start it with ./run.sh.{privacy_hint(project.root)}")
+    start = time.time()
+    write_atomic(live.dir / "pick", str(start))
+    print("tap an element in the Simulator… (ctrl-c to cancel)", file=sys.stderr)
+    try:
+        while time.time() - start < args.timeout:
+            sel = live.read("selection.json")
+            if sel and float(sel.get("at", 0)) >= start:
+                d = Design(project)
+                loc = d.index().get(sel.get("id"))
+                print(f"selected {sel.get('id')}  ({sel.get('type')} on '{sel.get('screen')}')")
+                if loc is not None:
+                    if loc.ancestors:
+                        print(f"inside   {' ‹ '.join(reversed(loc.ancestors))}")
+                    print(compact(loc.node)[:800])
+                return 0
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            (live.dir / "pick").unlink()
+        except FileNotFoundError:
+            pass
+    print("no element picked")
+    return 1
+
+
+def cmd_status(project: Project, args) -> int:
+    live = Live(project)
+    st = live.status()
+    if not st:
+        print(f"app has not reported yet (start it with ./run.sh).{privacy_hint(project.root)}")
+        return 1
+    alive = live.app_alive(st)
+    print(f"app      {'running' if alive else 'not running'} (pid {st.get('pid')})")
+    print(f"screen   {st.get('screen')}   stack: {' › '.join(st.get('stack') or [])}")
+    print(f"rev      {st.get('rev')}")
+    if st.get("error"):
+        print(f"error    {st['error']}")
+    if st.get("selected"):
+        print(f"selected {st['selected']}")
+    return 0 if alive else 1
+
+
+def cmd_shot(project: Project, args) -> int:
+    print(take_screenshot(project, args.path, small=args.small))
+    return 0
+
+
+def cmd_stats(project: Project, args) -> int:
+    path = project.live / "timings.jsonl"
+    if not path.exists():
+        print("no timings yet")
+        return 1
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines()[-500:]:
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+
+    def pct(vals, q):
+        vals = sorted(vals)
+        return vals[min(len(vals) - 1, int(q * len(vals)))] if vals else 0
+
+    for kind in ("ask", "variants", "apply", "tune"):
+        rs = [r for r in rows if r.get("kind") == kind]
+        if not rs:
+            continue
+        parts = [f"{kind:<9} n={len(rs):<4}"]
+        for field in ("model_s", "first_s", "write_s", "render_s"):
+            vals = [r[field] for r in rs if isinstance(r.get(field), (int, float))]
+            if vals:
+                parts.append(f"{field} p50 {pct(vals, .5):.2f} p90 {pct(vals, .9):.2f}")
+        cached = [r.get("tok_cache_read", 0) for r in rs if "tok_in" in r]
+        if cached:
+            parts.append(f"cache hits {sum(1 for c in cached if c)}/{len(cached)}")
+        print("  ".join(parts))
+    return 0
+
+
+TUNE_KEYS = [
+    ("+", "size", 1), ("-", "size", -1), ("]", "padding", 1), ("[", "padding", -1),
+    ("}", "spacing", 1), ("{", "spacing", -1), ("r", "radius", 1), ("R", "radius", -1),
+    ("w", "weight", 1), ("W", "weight", -1), ("o", "opacity", -1), ("O", "opacity", 1),
+]
+TUNE_HELP = ("+/- size  ]/[ padding  }/{ spacing  r/R radius  w/W weight  o/O opacity  "
+             "c fg color  b bg color  s style  v variant  u undo  p pick  q quit")
+
+
+def cycle(options: list, current):
+    if not options:
+        raise UIError("nothing to cycle through")
+    if current in options:
+        return options[(options.index(current) + 1) % len(options)]
+    return options[0]
+
+
+def tune_op(project: Project, nid: str, key: str):
+    for k, prop, by in TUNE_KEYS:
+        if key == k:
+            return {"op": "nudge", "id": nid, "prop": prop, "by": by}
+    d = Design(project)
+    node = d.find(nid).node
+    tokens = d.tokens if isinstance(d.tokens, dict) else {}
+    colors = ["$" + c for c in (tokens.get("colors") or {})]
+    if key == "c":
+        return {"op": "set", "id": nid, "props": {"foreground": cycle(colors, node.get("foreground"))}}
+    if key == "b":
+        return {"op": "set", "id": nid, "props": {"background": cycle(colors, node.get("background"))}}
+    if key == "s":
+        styles = list((tokens.get("styles") or {}))
+        return {"op": "set", "id": nid, "props": {"style": cycle(styles, node.get("style"))}}
+    if key == "v":
+        if node.get("type") != "button":
+            raise UIError("v cycles button variants; pick a button")
+        order = ["primary", "secondary", "glassProminent", "glass", "borderless", "plain"]
+        return {"op": "set", "id": nid, "props": {"variant": cycle(order, node.get("variant"))}}
+    return None
+
+
+def read_key() -> str:
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        return sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def cmd_tune(project: Project, args) -> int:
+    live = Live(project)
+    nid = args.id
+    if not nid:
+        sel = live.read("selection.json") or {}
+        nid = sel.get("id")
+    if not nid:
+        if cmd_pick(project, argparse.Namespace(timeout=120)) != 0:
+            return 1
+        nid = (live.read("selection.json") or {}).get("id")
+    Design(project).find(nid)
+    print(f"tuning {nid}   {TUNE_HELP}")
+    changes = []
+    while True:
+        try:
+            key = read_key()
+        except (EOFError, KeyboardInterrupt):
+            key = "q"
+        if key in ("q", "\x03", "\x1b"):
+            break
+        try:
+            if key == "u":
+                cmd_undo(project, argparse.Namespace(steps=1))
+                continue
+            if key == "p":
+                if cmd_pick(project, argparse.Namespace(timeout=120)) == 0:
+                    nid = (live.read("selection.json") or {}).get("id") or nid
+                    print(f"tuning {nid}")
+                continue
+            op = tune_op(project, nid, key)
+            if op is None:
+                continue
+            t0 = time.time()
+            res = run_ops(project, [op], wait=False, quiet=True, record=False)
+            live.timing({"kind": "tune", "write_s": round(time.time() - t0, 3)})
+            changes.append(op.get("prop") or ",".join(op.get("props", {})))
+            print(f"ok  {'; '.join(res['summary'])}")
+        except UIError as e:
+            print(f"error {e}")
+    if changes:
+        live.log({"at": time.time(), "request": f"(tuned {nid} by hand)", "ops": [f"tune {nid}: {', '.join(sorted(set(changes)))}"],
+                  "changed": [nid]})
+    return 0
+
+
+def cmd_validate(project: Project, args) -> int:
+    if args.hook:
+        payload = getattr(args, "hook_payload", None)
+        if payload is None:
+            try:
+                payload = json.loads(sys.stdin.read() or "{}")
+            except json.JSONDecodeError:
+                return 0
+        path = (payload.get("tool_input") or {}).get("file_path") or ""
+        try:
+            Path(path).resolve().relative_to(project.design.resolve())
+        except ValueError:
+            return 0
+        if not path.endswith(".json"):
+            return 0
+    d = Design(project)
+    v = Validator(d).run()
+    if v.errors:
+        msg = "design validation failed (the app keeps showing the last good version):\n  " + "\n  ".join(v.errors)
+        print(msg, file=sys.stderr)
+        return 2 if args.hook else 1
+    if not args.hook:
+        n = len(d.all_ids())
+        print(f"ok  {len(d.screens)} screens, {n} elements valid")
+        for w in v.warnings:
+            print(f"    note: {w}")
+    return 0
+
+
+HEREDOC_FIRST = re.compile(r"^\./ui (apply|context|undo|status|shot|pick|validate|stats|reference|next|prev|keep)"
+                           r"((?: [A-Za-z0-9_.@/=-]+)*)(?: <<'([A-Z]{2,10})')?$")
+
+
+def inert_ui_command(cmd: str) -> bool:
+    """True for `./ui <cmd> [simple args]` optionally followed by a quoted heredoc whose
+    body (inert data: quoted heredocs are not expanded) ends at the very last line."""
+    lines = cmd.rstrip("\n").split("\n")
+    m = HEREDOC_FIRST.match(lines[0].strip())
+    if not m:
+        return False
+    delim = m.group(3)
+    if delim is None:
+        return len(lines) == 1
+    if len(lines) < 2 or lines[-1] != delim:
+        return False
+    return all(line != delim for line in lines[1:-1])
+
+
+def cmd_hook(project: Project, args) -> int:
+    """One entry point for Claude Code hooks (fast, never blocks on errors):
+    UserPromptSubmit -> adds the live UI context; PreToolUse(Bash) -> allows inert
+    `./ui ...` heredoc commands without a prompt; PostToolUse(Edit/Write) ->
+    validates design JSON (exit 2 = tell the model); PostToolUse(Bash) -> ends the
+    turn after a successful `./ui apply --end-turn` (no second model call)."""
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        return 0
+    event = payload.get("hook_event_name")
+    tool = payload.get("tool_name")
+    ti = payload.get("tool_input") or {}
+    if event == "UserPromptSubmit":
+        if os.environ.get("UI_NO_CONTEXT_HOOK"):
+            return 0
+        try:
+            ctx = build_context(project, request=str(payload.get("prompt", ""))[:500])
+        except Exception:
+            return 0
+        print(f"<ui-context note=\"live state of the prototype; UI edits go through ./ui apply\">\n{ctx}\n</ui-context>")
+        return 0
+    if event == "PreToolUse" and tool == "Bash":
+        if inert_ui_command(str(ti.get("command", ""))):
+            print(compact({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
+                                                  "permissionDecisionReason": "./ui with inert heredoc"}}))
+        return 0
+    if event == "PostToolUse" and tool in ("Edit", "Write", "MultiEdit"):
+        return cmd_validate(project, argparse.Namespace(hook=True, hook_payload=payload))
+    if event == "PostToolUse" and tool == "Bash":
+        first = str(ti.get("command", "")).split("\n")[0]
+        if first.startswith("./ui apply") and "--end-turn" in first:
+            info = Live(project).read("last-apply.json") or {}
+            if not info or time.time() - float(info.get("at", 0)) > 60:
+                return 0
+            where = {"live": f"live on '{info.get('screen')}' in {info.get('seconds')}s",
+                     "down": "saved — app not running (./run.sh)",
+                     "unconfirmed": "saved — app didn't confirm"}.get(info.get("app"), "")
+            msg = f"✓ {info.get('say') or '; '.join(info.get('summary') or [])} · {where}"
+            if info.get("error"):
+                msg += f" · app error: {info['error']}"
+            print(compact({"continue": False, "stopReason": msg}))
+        return 0
+    return 0
+
+
+def cmd_reference(project: Project, args) -> int:
+    print(project.reference.read_text(encoding="utf-8"))
+    return 0
+
+
+def cmd_ask(project: Project, args) -> int:
+    request = " ".join(args.request).strip()
+    if not request:
+        raise UIError("say what to change, e.g. ./ui ask \"make the header bolder\"")
+    backend = make_backend(project, args.model, args.think)
+    ask(project, backend, request, variants=args.n, dry=args.dry_run, shot=args.shot)
+    return 0
+
+
+def cmd_variant_step(project: Project, args, step: int) -> int:
+    state = Live(project).read("variants.json")
+    if not state:
+        raise UIError("no variants in progress (use ./ui ask -n 3 \"...\")")
+    show_variant(project, state.get("current", 0) + step, shot=getattr(args, "shot", False))
+    return 0
+
+
+def cmd_keep(project: Project, args) -> int:
+    live = Live(project)
+    state = live.read("variants.json")
+    if not state:
+        print("no variants in progress")
+        return 1
+    (live.dir / "variants.json").unlink()
+    print(f"ok  kept variant {state.get('current', 0) + 1}: {state['variants'][state.get('current', 0)]['name']}")
+    return 0
+
+
+CHAT_HELP = """type a change, or: undo · pick · tune · next · prev · keep · shot · status · context · !<ops json> · quit"""
+
+
+def cmd_chat(project: Project, args) -> int:
+    backend = make_backend(project, args.model, args.think)
+    import threading
+
+    threading.Thread(target=backend.warm, args=(system_prompt(project),), daemon=True).start()
+    print(f"ui chat · {backend.name} · {args.model}   ({CHAT_HELP})")
+    while True:
+        try:
+            line = input("ui> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not line:
+            continue
+        try:
+            word = line.split()[0].lower()
+            if word in ("quit", "exit", "q"):
+                return 0
+            if word == "help":
+                print(CHAT_HELP)
+            elif word == "undo":
+                cmd_undo(project, argparse.Namespace(steps=1))
+            elif word == "pick":
+                cmd_pick(project, argparse.Namespace(timeout=60))
+            elif word in ("next", "prev"):
+                cmd_variant_step(project, argparse.Namespace(shot=False), 1 if word == "next" else -1)
+            elif word == "keep":
+                cmd_keep(project, args)
+            elif word == "shot":
+                print(take_screenshot(project))
+            elif word == "tune":
+                cmd_tune(project, argparse.Namespace(id=line.split()[1] if len(line.split()) > 1 else None))
+            elif word == "status":
+                cmd_status(project, args)
+            elif word == "context":
+                print(build_context(project))
+            elif line.startswith("!"):
+                run_ops(project, parse_ops(line[1:]), note="(manual ops)")
+            else:
+                n = 1
+                m = re.match(r"^-n\s*(\d+)\s+(.*)$", line)
+                if m:
+                    n, line = int(m.group(1)), m.group(2)
+                ask(project, backend, line, variants=n)
+        except Escalate as e:
+            print(f"ESCALATE: {e}")
+        except UIError as e:
+            print(f"error {e}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="ui", description="Live UI engine: edit design/*.json fast and safely.",
+                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n\n")[1])
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("context", help="compact map of the current screen for a model")
+    s.add_argument("--screen", help="screen id (default: what the Simulator shows)")
+    s.add_argument("--request", default="", help="the user's request (adds text→id matches)")
+
+    s = sub.add_parser("apply", help="apply ops JSON (argument, @file, or stdin)")
+    s.add_argument("ops", nargs="?")
+    s.add_argument("--shot", action="store_true", help="screenshot after the app renders")
+    s.add_argument("--no-wait", action="store_true", help="don't wait for the app to confirm")
+    s.add_argument("--note", help="what was asked (kept in history for follow-ups)")
+    s.add_argument("--end-turn", action="store_true", help="(read by the Claude Code hook) end the turn on success")
+
+    s = sub.add_parser("undo", help="revert the last apply")
+    s.add_argument("steps", nargs="?", type=int, default=1)
+
+    s = sub.add_parser("pick", help="tap an element in the Simulator to get its id")
+    s.add_argument("--timeout", type=float, default=120)
+
+    sub.add_parser("status", help="what the running app is showing")
+
+    s = sub.add_parser("shot", help="Simulator screenshot")
+    s.add_argument("path", nargs="?")
+    s.add_argument("--small", action="store_true", help="also write a ~900px JPEG (for phones / model context)")
+
+    sub.add_parser("stats", help="latency percentiles from .live/timings.jsonl")
+
+    s = sub.add_parser("tune", help="no-model fast lane: single keys nudge the picked element")
+    s.add_argument("id", nargs="?")
+
+    s = sub.add_parser("validate", help="check design/*.json")
+    s.add_argument("--hook", action="store_true", help="Claude Code PostToolUse hook mode (exit 2 on errors)")
+
+    sub.add_parser("reference", help="print the ops / node reference")
+    sub.add_parser("hook", help="Claude Code hook entry point (reads hook JSON on stdin)")
+
+    for name in ("ask", "chat"):
+        s = sub.add_parser(name, help="one model call -> ops -> applied" if name == "ask" else "interactive loop")
+        if name == "ask":
+            s.add_argument("request", nargs="*")
+            s.add_argument("-n", type=int, default=1, help="number of variants to generate")
+            s.add_argument("--dry-run", action="store_true", help="print ops without applying")
+            s.add_argument("--shot", action="store_true", help="screenshot after the app renders")
+        s.add_argument("--model", default=os.environ.get("UI_MODEL", DEFAULT_MODEL))
+        s.add_argument("--think", action="store_true", help="let the model think first (slower, for big changes)")
+
+    for name in ("next", "prev"):
+        s = sub.add_parser(name, help=f"show the {name} variant")
+        s.add_argument("--shot", action="store_true")
+    sub.add_parser("keep", help="keep the variant on screen")
+    return p
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.cmd:
+        parser.print_help()
+        return 0
+    project = Project(find_project())
+    if not project.design.exists() and args.cmd not in ("reference",):
+        print(f"error no design/ folder found (looked in {project.root})", file=sys.stderr)
+        return 1
+    handlers = {
+        "context": cmd_context, "apply": cmd_apply, "undo": cmd_undo, "pick": cmd_pick, "status": cmd_status,
+        "shot": cmd_shot, "validate": cmd_validate, "reference": cmd_reference, "ask": cmd_ask, "chat": cmd_chat,
+        "keep": cmd_keep, "stats": cmd_stats, "tune": cmd_tune, "hook": cmd_hook,
+        "next": lambda pr, a: cmd_variant_step(pr, a, 1),
+        "prev": lambda pr, a: cmd_variant_step(pr, a, -1),
+    }
+    try:
+        return handlers[args.cmd](project, args)
+    except Escalate as e:
+        print(f"ESCALATE: {e}\n  (not expressible in design JSON: add a Swift view in Sources/Components, "
+              f"register it, ./run.sh once, then place it with a custom node)")
+        return 3
+    except UIError as e:
+        print(f"error {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

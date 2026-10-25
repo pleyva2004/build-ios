@@ -1,0 +1,115 @@
+name: live-ui template
+
+# Compiles the scaffolded app with Xcode and runs an end-to-end hot-reload smoke
+# test in the iOS Simulator: launch -> app reports a live link -> ./ui apply ->
+# app confirms the new revision -> before/after screenshots (uploaded as artifacts).
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "templates/**"
+      - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/ios.yml"
+
+jobs:
+  unit:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests on the system python3 (oldest supported) and the runner python
+        run: |
+          /usr/bin/python3 --version
+          /usr/bin/python3 -m unittest discover -s tests -v
+          python3 -m unittest discover -s tests
+
+  build-and-smoke:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: |
+          XC="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          [ -n "$XC" ] && sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun simctl list runtimes | grep -i ios || true
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Scaffold Demo app
+        run: bash scripts/scaffold.sh Demo "$RUNNER_TEMP" com.example
+
+      - name: Validate design JSON
+        working-directory: ${{ runner.temp }}/Demo
+        run: ./ui validate
+
+      - name: Build (Debug, iOS Simulator)
+        working-directory: ${{ runner.temp }}/Demo
+        run: |
+          set -o pipefail
+          xcodebuild -project Demo.xcodeproj -scheme Demo -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath build \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES COMPILER_INDEX_STORE_ENABLE=NO \
+            build 2>&1 | tee build.log | grep -E "error:|warning: |BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" build.log
+
+      - name: Hot-reload smoke test
+        working-directory: ${{ runner.temp }}/Demo
+        run: |
+          set -euo pipefail
+          UDID="$(xcrun simctl list devices available | grep -E '^\s+iPhone' | head -1 | grep -oE '[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}')"
+          echo "device $UDID"
+          mkdir -p .live && echo "$UDID" > .live/device
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl install "$UDID" build/Build/Products/Debug-iphonesimulator/Demo.app
+          SIMCTL_CHILD_UI_PROJECT_DIR="$PWD" xcrun simctl launch "$UDID" com.example.Demo -UIProjectDir "$PWD"
+          for i in $(seq 1 150); do [ -f .live/status.json ] && break; sleep 0.2; done
+          cat .live/status.json
+          ./ui status
+          sleep 4
+          xcrun simctl io "$UDID" screenshot .live/1-launch.png
+
+          # 1) token + text change: the app must confirm the new revision
+          ./ui apply --shot <<'OPS'
+          {"say": "CI smoke: brand color + title", "ops": [
+            {"op": "token", "path": "colors.brand", "value": "#E11D48"},
+            {"op": "set", "id": "home.hero.title", "props": {"text": "Hot reload works", "size": 28}},
+            {"op": "insert", "after": "home.hero.subtitle", "node": {"type": "text", "text": "Added live, no rebuild"}}
+          ]}
+          OPS
+          cp .live/shot.png .live/2-after-apply.png
+
+          # 2) invalid ops are rejected before they reach the app (exit 1)
+          if ./ui apply '{"op":"set","id":"nope","props":{"text":"x"}}'; then echo "invalid op was accepted"; exit 1; fi
+
+          # 3) undo restores the design
+          ./ui undo
+          sleep 1
+          xcrun simctl io "$UDID" screenshot .live/3-after-undo.png
+
+          python3 - <<'PY'
+          import json, sys
+          s = json.load(open(".live/status.json"))
+          print(s)
+          assert s.get("source") in ("env", "defaults", "source"), "app is not live: %s" % s.get("source")
+          assert s.get("rev", 0) >= 2, "app did not confirm the revisions"
+          assert not s.get("error"), s.get("error")
+          PY
+          ./ui status
+          ./ui stats || true
+
+      - name: Upload screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-ui-smoke
+          path: |
+            ${{ runner.temp }}/Demo/.live/*.png
+            ${{ runner.temp }}/Demo/.live/status.json
+            ${{ runner.temp }}/Demo/build.log
+          if-no-files-found: warn

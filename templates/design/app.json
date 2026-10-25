@@ -1,0 +1,11 @@
+{
+  "name": "__APP_NAME__",
+  "tint": "$brand",
+  "colorScheme": "system",
+  "state": { "notifications": true, "query": "", "plan": "Monthly" },
+  "tabs": [
+    { "id": "home", "title": "Home", "symbol": "house", "screen": "home" },
+    { "id": "explore", "title": "Explore", "symbol": "square.grid.2x2", "screen": "explore" },
+    { "id": "profile", "title": "Profile", "symbol": "person.crop.circle", "screen": "profile" }
+  ]
+}

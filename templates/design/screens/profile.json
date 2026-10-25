@@ -1,0 +1,104 @@
+{
+  "id": "profile",
+  "title": "Profile",
+  "titleDisplay": "large",
+  "body": {
+    "type": "list",
+    "id": "profile.list",
+    "listStyle": "insetGrouped",
+    "children": [
+      {
+        "type": "section",
+        "id": "profile.account",
+        "children": [
+          {
+            "type": "hstack",
+            "id": "profile.header",
+            "spacing": "$md",
+            "children": [
+              {
+                "type": "image",
+                "id": "profile.avatar",
+                "symbol": "person.crop.circle.fill",
+                "size": 52,
+                "foreground": "$brand"
+              },
+              {
+                "type": "vstack",
+                "id": "profile.identity",
+                "align": "leading",
+                "spacing": "$xs",
+                "children": [
+                  {
+                    "type": "text",
+                    "id": "profile.name",
+                    "text": "Jordan Lee",
+                    "font": "$headline"
+                  },
+                  {
+                    "type": "text",
+                    "id": "profile.email",
+                    "text": "jordan@example.com",
+                    "style": "secondaryText"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "id": "profile.preferences",
+        "header": "Preferences",
+        "children": [
+          {
+            "type": "toggle",
+            "id": "profile.notifications",
+            "text": "Notifications",
+            "bind": "notifications"
+          },
+          {
+            "type": "picker",
+            "id": "profile.plan",
+            "text": "Plan",
+            "bind": "plan",
+            "options": [
+              "Monthly",
+              "Yearly"
+            ],
+            "pickerStyle": "segmented"
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "id": "profile.more",
+        "footer": "Version 1.0",
+        "children": [
+          {
+            "type": "label",
+            "id": "profile.help",
+            "text": "Help & feedback",
+            "symbol": "questionmark.circle",
+            "onTap": {
+              "url": "https://example.com/help"
+            }
+          },
+          {
+            "type": "button",
+            "id": "profile.signout",
+            "text": "Sign out",
+            "action": {
+              "alert": {
+                "title": "Signed out",
+                "message": "This is a demo."
+              }
+            },
+            "variant": "destructive"
+          }
+        ]
+      }
+    ]
+  }
+}
