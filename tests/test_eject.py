@@ -314,6 +314,14 @@ class TranslationTest(EjectCase):
         self.assertIn('Text("Plain words")', s)
         self.assertIn('Toggle("a_b" as String, isOn: $state.ab)', s)
 
+    def test_emails_and_urls_are_not_turned_into_links(self):
+        s = self.body({"type": "vstack", "id": "home.root", "children": [
+            {"type": "text", "id": "home.a", "text": "jordan@example.com"},
+            {"type": "text", "id": "home.b", "text": "https://example.com"},
+        ]})
+        self.assertIn('Text(verbatim: "jordan@example.com")', s)
+        self.assertIn('Text(verbatim: "https://example.com")', s)
+
     def test_custom_and_unknown_nodes_become_placeholders_with_todos(self):
         report = None
         self.edit("screens/home.json", lambda d: d.update(body={"type": "vstack", "id": "home.root", "children": [

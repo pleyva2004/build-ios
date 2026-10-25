@@ -86,7 +86,8 @@ HANDLED_PROPS = {
     "placeholder", "secure", "keyboard", "fieldStyle", "options", "pickerStyle", "shape", "fill", "value",
     "minLength", "items", "name",
 }
-MARKDOWN_CHARS = set("*_~`[]%\\<")
+# "@" and ":" too: LocalizedStringKey markdown turns emails and URLs into tinted links.
+MARKDOWN_CHARS = set("*_~`[]%\\<@:")
 IND = "    "
 
 
