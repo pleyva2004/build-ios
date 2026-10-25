@@ -10,10 +10,12 @@ Simulator hot-reloads those files in ~0.2 s, so UI changes never need a rebuild.
   each prompt. If it's missing, run `./ui context` once.
 - Make the change with ONE call. It validates, applies atomically, and waits for the app:
   ```
-  ./ui apply <<'OPS'
+  ./ui apply --end-turn <<'OPS'
   {"say": "<= 12 words: what changes", "ops": [ ... ]}
   OPS
   ```
+  `--end-turn` ends your turn as soon as the app confirms, with `say` as the reply, so
+  don't write a summary. Leave it off only if you need more calls this turn.
 - If it's rejected, fix the ops from the error text and call once more.
 - Never edit `Sources/Runtime/` to change the UI, and never rebuild for a UI change.
 - Undo: `./ui undo`. Screenshots only when asked: `./ui shot --small`, then read the file.

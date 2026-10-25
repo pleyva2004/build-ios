@@ -224,8 +224,29 @@ class NudgeOpTest(ProjectCase):
 
     def test_radius_token_ladder(self):
         self.assertEqual(self.nudge("home.story.image", "radius")["radius"], "$lg")
-        # $pill (999) is not a step on the ladder
-        self.assertEqual(self.nudge("home.story.image", "radius")["radius"], "$lg")
+        # past the largest step ($pill = 999 is not a step) it keeps growing as a number
+        self.assertEqual(self.nudge("home.story.image", "radius")["radius"], 29)
+        self.assertEqual(self.nudge("home.story.image", "radius", -1)["radius"], "$lg")
+
+    def test_nudge_that_changes_nothing_is_rejected(self):
+        self.apply({"op": "set", "id": "home.section", "props": {"size": 11, "weight": "black"}})
+        for prop, by in (("size", -1), ("weight", 1)):
+            with self.assertRaises(ui.UIError) as cm:
+                self.apply({"op": "nudge", "id": "home.section", "prop": prop, "by": by})
+            self.assertIn("use set", str(cm.exception))
+        self.apply({"op": "set", "id": "home.hero.cta", "props": {"controlSize": "extraLarge"}})
+        with self.assertRaises(ui.UIError):
+            self.apply({"op": "nudge", "id": "home.hero.cta", "prop": "size"})
+        with self.assertRaises(ui.UIError):
+            self.apply({"op": "nudge", "id": "home.hero", "prop": "opacity"})  # already 1.0
+        self.apply({"op": "set", "id": "home.scroll", "props": {"spacing": 0}})
+        with self.assertRaises(ui.UIError):
+            self.apply({"op": "nudge", "id": "home.scroll", "prop": "spacing", "by": -1})
+        self.assertEqual(self.nudge("home.scroll", "spacing")["spacing"], "$xs")
+
+    def test_size_keeps_growing_past_the_type_scale(self):
+        self.apply({"op": "set", "id": "home.section", "props": {"size": 64}})
+        self.assertEqual(self.nudge("home.section", "size")["size"], 83)
 
     def test_weight(self):
         self.assertEqual(self.nudge("home.section", "weight")["weight"], "bold")  # $headline is semibold
@@ -1152,7 +1173,8 @@ class ContextTest(ProjectCase):
 
     def test_outline_tokens_and_other_screens(self):
         ctx = ui.build_context(self.project)
-        self.assertIn("# app Demo  (tabs: home→home, explore→explore, profile→profile)", ctx)
+        self.assertIn('# app Demo  (tabs (app.json): 0 home "Home"→home, 1 explore "Explore"→explore, '
+                      '2 profile "Profile"→profile)', ctx)
         self.assertIn("# simulator: app not running", ctx)
         self.assertIn("## screen home  (design/screens/home.json)", ctx)
         self.assertIn('home.hero.title text text="Good morning" font="$title" foreground="$text"', ctx)
@@ -1318,22 +1340,32 @@ class HookTest(ProjectCase):
             self.assertFalse(self.pre_bash(cmd), repr(cmd))
 
     def test_escalation_ends_the_turn_but_other_failures_do_not(self):
+        # Claude Code ignores `continue: false` from PostToolUseFailure, so with
+        # --end-turn an escalation exits 0 and PostToolUse ends the turn.
         cmd = "./ui apply --end-turn <<'OPS'\n{\"say\": \"maps need Swift\", \"ops\": []}\nOPS"
-        code, out, _ = self.hook({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
-                                  "tool_input": {"command": cmd},
-                                  "error": "Exit code 3\nESCALATE: maps need Swift\n  (not expressible...)"})
+        before = self.design_bytes()
+        args = argparse.Namespace(ops='{"say": "maps need Swift", "ops": []}', note=None, no_wait=False,
+                                  shot=False, end_turn=True)
+        with captured() as (out, _):
+            self.assertEqual(ui.cmd_apply(self.project, args), 0)
+        self.assertIn("ESCALATE: maps need Swift", out.getvalue())
+        self.assertEqual(self.design_bytes(), before)
+        code, out, _ = self.post_bash(cmd)
         self.assertEqual(code, 0)
         stop = json.loads(out)
         self.assertIs(stop["continue"], False)
         self.assertIn("ESCALATE: maps need Swift", stop["stopReason"])
-        # a rejected apply (exit 1) must let the model retry
+        # a later successful apply is not mistaken for an escalation
+        self.apply({"op": "set", "id": "home.hero.title", "props": {"text": "Hi"}}, note="Friendlier")
+        self.assertNotIn("ESCALATE", json.loads(self.post_bash(cmd)[1])["stopReason"])
+        # failures (rejected ops) never end the turn, so the model can retry
         self.assertEqual(self.hook({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
                                     "tool_input": {"command": cmd},
                                     "error": "Exit code 1\nerror rejected, nothing was written"})[1], "")
-        # without --end-turn nothing happens
-        self.assertEqual(self.hook({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
-                                    "tool_input": {"command": cmd.replace(" --end-turn", "")},
-                                    "error": "Exit code 3\nESCALATE: x"})[1], "")
+        # without --end-turn an escalation is still exit 3
+        args.end_turn = False
+        with captured(), self.assertRaises(ui.Escalate):
+            ui.cmd_apply(self.project, args)
 
     def test_other_tools_and_bad_payloads_are_ignored(self):
         self.assertEqual(self.hook({"hook_event_name": "PreToolUse", "tool_name": "Read",
@@ -1393,6 +1425,43 @@ class HookTest(ProjectCase):
         info["at"] -= 120
         (self.live.dir / "last-apply.json").write_text(json.dumps(info))
         self.assertEqual(self.post_bash("./ui apply --end-turn <<'OPS'\n{}\nOPS"), (0, "", ""))
+
+
+class EvalCheckTest(ProjectCase):
+    def check(self, exp, ops=(), escalated=False):
+        base = ui.Design(self.project)
+        for op in ops:
+            self.apply(op)
+        return ui._check(ui.Design(self.project), base, exp, escalated)
+
+    def test_hidden_accepts_removal_or_visible_if(self):
+        exp = {"id": "profile.email", "hidden": True}
+        self.assertEqual(self.check(exp), "profile.email still visible")
+        self.assertEqual(self.check(exp, [{"op": "remove", "id": "profile.email"}]), "")
+
+    def test_hidden_by_visible_if(self):
+        exp = {"id": "profile.email", "hidden": True}
+        self.assertEqual(self.check(exp, [{"op": "set", "id": "profile.email", "props": {"visibleIf": "showEmail"}}]), "")
+
+    def test_missing_without_hidden_still_fails(self):
+        self.assertEqual(self.check({"id": "home.nope", "prop": "text", "eq": "x"}), "home.nope missing")
+
+    def test_size_gt_uses_the_rendered_size(self):
+        exp = {"id": "home.hero.title", "size_gt": 22}  # font $title = 22
+        self.assertEqual(self.check(exp), "home.hero.title text size 22")
+        self.assertEqual(self.check(exp, [{"op": "set", "id": "home.hero.title", "props": {"font": "$largeTitle"}}]), "")
+
+    def test_size_gt_explicit_size_wins_over_font(self):
+        exp = {"id": "home.hero.title", "size_gt": 24}
+        ops = [{"op": "set", "id": "home.hero.title", "props": {"size": 24}},
+               {"op": "set", "id": "home.hero.title", "props": {"font": "$largeTitle"}}]
+        self.assertEqual(self.check(exp, ops), "home.hero.title text size 24")
+
+    def test_app_path_and_escalation(self):
+        exp = {"app": "tabs.1.title", "eq": "Discover"}
+        self.assertEqual(self.check(exp, [{"op": "path", "file": "app", "path": "tabs.1.title",
+                                           "value": "Discover"}]), "")
+        self.assertEqual(self.check(exp, escalated=True), "escalated")
 
 
 # ---------------------------------------------------------------------------

@@ -1,8 +1,8 @@
 {"name": "pill teal cta (picked)", "select": "home.hero.cta", "request": "make this a teal pill", "expect": [{"id": "home.hero.cta", "prop": "radius", "eq": "$pill"}, {"id": "home.hero.cta", "prop": "tint", "in": ["teal", "#14B8A6", "#0D9488", "#008080"]}]}
 {"name": "brand color warmer", "request": "make the brand color warmer, like orange", "expect": [{"token": "colors.brand", "changed": true}, {"id": "home.hero.title", "unchanged": true}]}
 {"name": "one element blue not token", "select": "home.hero.title", "request": "make this text blue", "expect": [{"id": "home.hero.title", "prop": "foreground", "in": ["blue", "#0000FF", "#3B82F6", "#007AFF"]}, {"token": "colors.brand", "changed": false}]}
-{"name": "bigger title", "request": "make the 'Good morning' title bigger", "expect": [{"id": "home.hero.title", "prop": "size", "gt": 22}]}
-{"name": "follow-up bigger again", "setup": [{"op": "nudge", "id": "home.hero.title", "prop": "size", "by": 1}], "history": "make the title bigger", "request": "a bit bigger again", "expect": [{"id": "home.hero.title", "prop": "size", "gt": 24}]}
+{"name": "bigger title", "request": "make the 'Good morning' title bigger", "expect": [{"id": "home.hero.title", "size_gt": 22}]}
+{"name": "follow-up bigger again", "setup": [{"op": "nudge", "id": "home.hero.title", "prop": "size", "by": 1}], "history": "make the title bigger", "request": "a bit bigger again", "expect": [{"id": "home.hero.title", "size_gt": 24}]}
 {"name": "all cards more padding (style)", "request": "give all the cards more breathing room", "expect": [{"token": "styles.card.padding", "changed": true}]}
 {"name": "rename cta copy", "request": "change 'Start reading' to 'Read today's picks'", "expect": [{"id": "home.hero.cta", "prop": "text", "eq": "Read today's picks"}]}
 {"name": "subtitle under title", "request": "add a small grey line under 'Good morning' that says 'Tuesday, 5 picks'", "expect": [{"text_exists": "Tuesday, 5 picks", "screen": "home"}]}

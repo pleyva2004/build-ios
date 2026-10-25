@@ -15,9 +15,6 @@
     ],
     "PostToolUse": [
       { "matcher": "Edit|Write|MultiEdit|Bash", "hooks": [{ "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/ui hook", "timeout": 10 }] }
-    ],
-    "PostToolUseFailure": [
-      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/ui hook", "timeout": 10 }] }
     ]
   }
 }

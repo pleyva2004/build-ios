@@ -21,7 +21,8 @@ those changes fast and safe for people and for small, fast models:
   ./ui eval                 accuracy + latency of the model on tools/evals.jsonl
   ./ui hook                 Claude Code hook entry point (see .claude/settings.json)
 
-Exit codes: 0 ok · 1 error · 2 validation failed (hook) · 3 ESCALATE (needs Swift)
+Exit codes: 0 ok · 1 error · 2 validation failed (hook) · 3 ESCALATE (needs Swift;
+0 with --end-turn, where the hook ends the turn instead)
 
 Ops reference: tools/REFERENCE.md. Core commands need only the python3 that
 ships with macOS; `ask`/`chat` call Claude via the official anthropic SDK
@@ -39,6 +40,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -101,6 +103,10 @@ class UIError(Exception):
 
 class Escalate(Exception):
     """The request needs Swift (a custom component); exit code 3."""
+
+
+ESCALATE_HINT = ("(not expressible in design JSON: add a Swift view in Sources/Components, "
+                 "register it, ./run.sh once, then place it with a custom node)")
 
 
 # --------------------------------------------------------------------------
@@ -824,7 +830,8 @@ class Validator:
                 try:
                     float(v)
                 except ValueError:
-                    self.err(where, f"{k} must be a number, a $token or \"infinity\"")
+                    frame = k in {"width", "height", "maxWidth", "maxHeight"}
+                    self.err(where, f"{k} must be a number" + (", a $token or \"infinity\"" if frame else " or a $token"))
         else:
             self.err(where, f"{k} must be a number")
 
@@ -1374,6 +1381,9 @@ class Applier:
             raise UIError("by must be a non-zero integer (steps)")
         loc = self.d.find(nid)
         value = nudge_value(self.d, loc.node, prop, by)
+        if nudge_is_noop(self.d, loc.node, prop, value):
+            raise UIError(f"{nid}: {prop} is already at its {'largest' if by > 0 else 'smallest'} step; "
+                          f"use set with an explicit value")
         if isinstance(value, tuple) and value[0] == "controlSize":
             loc.node["controlSize"] = value[1]
             change = f"controlSize → {value[1]}"
@@ -1422,13 +1432,62 @@ class Applier:
         self.summary.append(f"path {f}:{path} = {compact(op.get('value'))[:60]}")
 
 
-def step_scale(scale: list, current: float, by: int) -> float:
-    """Moves `by` steps along a sorted scale from the nearest point to `current`."""
-    if by > 0:
-        bigger = [v for v in scale if v > current + 1e-9]
-        return bigger[min(by, len(bigger)) - 1] if bigger else scale[-1]
-    smaller = [v for v in scale if v < current - 1e-9]
-    return smaller[-min(-by, len(smaller))] if smaller else scale[0]
+def step_scale(scale: list, current: float, by: int, extend: bool = False) -> float:
+    """Moves `by` steps along a sorted scale from the nearest point to `current`.
+    With `extend`, steps past either end continue as plain numbers (x1.3 / x0.7),
+    so "rounder" on the largest radius token still changes something."""
+    value = current
+    for _ in range(abs(by)):
+        if by > 0:
+            bigger = [v for v in scale if v > value + 1e-9]
+            if bigger:
+                value = bigger[0]
+            elif extend:
+                value = float(max(value + 1, round(value * 1.3)))
+        else:
+            smaller = [v for v in scale if v < value - 1e-9]
+            if smaller:
+                value = smaller[-1]
+            elif extend:
+                value = float(max(0, round(value * 0.7)))
+    return value
+
+
+def effective_text_size(design: Design, node: dict) -> float:
+    """The point size a text node renders at: `size`, else its font (own or style's)."""
+    tokens = design.tokens if isinstance(design.tokens, dict) else {}
+    styles = tokens.get("styles") if isinstance(tokens.get("styles"), dict) else {}
+    style = styles.get(str(node.get("style", "")).lstrip("$"), {}) if node.get("style") else {}
+    style = style if isinstance(style, dict) else {}
+    size = node.get("size", style.get("size"))
+    if isinstance(size, (int, float)) and not isinstance(size, bool):
+        return float(size)
+    font = node.get("font", style.get("font"))
+    if isinstance(font, str) and font.startswith("$"):
+        font = (tokens.get("fonts") or {}).get(font[1:])
+    if isinstance(font, dict) and isinstance(font.get("size"), (int, float)):
+        return float(font["size"])
+    return float(TEXT_STYLE_SIZES.get(font, 17)) if isinstance(font, str) else 17.0
+
+
+def nudge_is_noop(design: Design, node: dict, prop: str, value) -> bool:
+    """True when a nudge would leave the element looking the same (end of a scale)."""
+    if isinstance(value, tuple) and value[0] == "controlSize":
+        return node.get("controlSize", "regular") == value[1]
+    if isinstance(value, tuple):
+        return all(node.get(k) == v for k, v in value[1].items())
+    tokens = design.tokens if isinstance(design.tokens, dict) else {}
+    styles = tokens.get("styles") if isinstance(tokens.get("styles"), dict) else {}
+    style = styles.get(str(node.get("style", "")).lstrip("$"), {}) if node.get("style") else {}
+    cur = node.get(prop, style.get(prop) if isinstance(style, dict) else None)
+    if cur is None and prop == "opacity":
+        cur = 1.0
+    if cur is None and prop == "size":
+        font = node.get("font", style.get("font") if isinstance(style, dict) else None)
+        if isinstance(font, str) and font.startswith("$"):
+            font = (tokens.get("fonts") or {}).get(font[1:])
+        cur = font.get("size") if isinstance(font, dict) else TEXT_STYLE_SIZES.get(font, 17) if isinstance(font, str) else 17
+    return cur == value
 
 
 def nudge_value(design: Design, node: dict, prop: str, by: int):
@@ -1462,7 +1521,9 @@ def nudge_value(design: Design, node: dict, prop: str, by: int):
                 size = TEXT_STYLE_SIZES.get(font, 17)
             else:
                 size = 17
-        return step_scale(TYPE_SCALE, float(size), by)
+        # bigger keeps growing past the scale; smaller stops at 11 pt (legibility)
+        out = min(400.0, step_scale(TYPE_SCALE, float(size), by, extend=by > 0))
+        return int(out) if float(out).is_integer() else out
     if prop in ("padding", "spacing", "radius"):
         group = (tokens.get("radius") if prop == "radius" else tokens.get("spacing")) or {}
         named = sorted(((v, k) for k, v in group.items() if isinstance(v, (int, float)) and v < 500))
@@ -1478,8 +1539,11 @@ def nudge_value(design: Design, node: dict, prop: str, by: int):
         scale = [v for v, _ in named]
         if value is None:
             value = scale[0] - 1 if by > 0 else scale[0]
-        target = step_scale(scale, float(value), by)
-        return "$" + dict((v, k) for v, k in named)[target]
+        target = step_scale(scale, float(value), by, extend=True)
+        names = dict((v, k) for v, k in named)
+        if target in names:
+            return "$" + names[target]
+        return int(target) if float(target).is_integer() else target
     if prop == "weight":
         if cur not in WEIGHT_ORDER:  # start from the font's weight, so "bolder" never lightens
             cur = font.get("weight") if isinstance(font, dict) else ("semibold" if font == "headline" else None)
@@ -1874,7 +1938,9 @@ def build_context(project: Project, screen: str = None, request: str = "") -> st
     tabs = d.app.get("tabs")
     nav = ""
     if isinstance(tabs, list):
-        nav = "tabs: " + ", ".join(f"{t.get('id')}→{t.get('screen', t.get('id'))}" for t in tabs if isinstance(t, dict))
+        nav = "tabs (app.json): " + ", ".join(
+            f"{i} {t.get('id')} \"{t.get('title', '')}\"→{t.get('screen', t.get('id'))}"
+            for i, t in enumerate(tabs) if isinstance(t, dict))
     elif d.app.get("root"):
         nav = f"root: {d.app.get('root')}"
     L.append(f"# app {d.app.get('name', '')}  ({nav})")
@@ -2119,9 +2185,17 @@ class ClaudeCLIBackend(Backend):
         )
         cmd = ["claude", "-p", "--model", self.model, "--output-format", "json", "--tools", "",
                "--system-prompt-file", str(sys_file)]
+        # The prompt already carries the context and reference: skip the project's
+        # hooks and CLAUDE.md (run outside it), MCP servers and skills. Halves the tokens.
+        lean = ["--setting-sources", "user", "--strict-mcp-config", "--disable-slash-commands",
+                "--no-session-persistence"]
+        env = dict(os.environ, UI_NO_CONTEXT_HOOK="1")
         try:
-            proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=120,
-                                  cwd=str(self.project.root))
+            proc = subprocess.run(cmd + lean, input=prompt, capture_output=True, text=True, timeout=120,
+                                  cwd=tempfile.gettempdir(), env=env)
+            if proc.returncode != 0 and "unknown option" in (proc.stderr or ""):  # older Claude Code
+                proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=120,
+                                      cwd=tempfile.gettempdir(), env=env)
         except FileNotFoundError:
             raise UIError("`claude` not found on PATH")
         except subprocess.TimeoutExpired:
@@ -2363,6 +2437,14 @@ def cmd_apply(project: Project, args) -> int:
             env = json.loads(raw)
             if isinstance(env, dict) and isinstance(env.get("say"), str):
                 note = env["say"]
+                if env.get("ops") == [] and args.end_turn:
+                    # Claude Code ignores `continue: false` from PostToolUseFailure hooks,
+                    # so an escalation that should end the turn succeeds (exit 0) and the
+                    # PostToolUse hook stops the turn with this message.
+                    write_atomic(Live(project).dir / "last-apply.json",
+                                 compact({"at": time.time(), "say": note, "escalate": note or "needs Swift"}))
+                    print(f"ESCALATE: {note}\n  {ESCALATE_HINT}")
+                    return 0
                 if env.get("ops") == []:
                     raise Escalate(note)
         except json.JSONDecodeError:
@@ -2671,21 +2753,17 @@ def cmd_hook(project: Project, args) -> int:
         return 0
     if event == "PostToolUse" and tool in ("Edit", "Write", "MultiEdit"):
         return cmd_validate(project, argparse.Namespace(hook=True, hook_payload=payload))
-    if event == "PostToolUseFailure" and tool == "Bash":
-        # /ui escalation (ops: [] -> exit 3) also ends the turn; other failures don't,
-        # so the model can still fix rejected ops and retry once.
-        first = str(ti.get("command", "")).split("\n")[0]
-        err = str(payload.get("error", "")) + str(payload.get("tool_response", ""))
-        if first.startswith("./ui apply") and "--end-turn" in first and "ESCALATE:" in err:
-            line = next((l for l in err.splitlines() if "ESCALATE:" in l), "ESCALATE")
-            msg = line[line.index("ESCALATE:"):].strip()
-            print(compact({"continue": False, "stopReason": f"{msg} (needs a Swift component — see CLAUDE.md)"}))
-        return 0
     if event == "PostToolUse" and tool == "Bash":
+        # Only successful calls get here: a rejected apply (exit 1) reaches
+        # PostToolUseFailure instead, so the model can fix the ops and retry.
         first = str(ti.get("command", "")).split("\n")[0]
         if first.startswith("./ui apply") and "--end-turn" in first:
             info = Live(project).read("last-apply.json") or {}
             if not info or time.time() - float(info.get("at", 0)) > 60:
+                return 0
+            if info.get("escalate"):
+                print(compact({"continue": False, "stopReason":
+                               f"ESCALATE: {info['escalate']} (needs a Swift component — see CLAUDE.md)"}))
                 return 0
             where = {"live": f"live on '{info.get('screen')}' in {info.get('seconds')}s",
                      "down": "saved — app not running (./run.sh)",
@@ -2833,7 +2911,8 @@ def _check(design: Design, base: Design, exp: dict, escalated: bool) -> str:
     if "exists" in exp:
         return "" if (loc is not None) == exp["exists"] else f"{nid} exists={loc is not None}"
     if loc is None:
-        return f"{nid} missing"
+        # "hide X" is satisfied by removing X (undo brings it back)
+        return "" if exp.get("hidden") and _node_by_id(base, nid) is not None else f"{nid} missing"
     node = loc.node
     if exp.get("unchanged"):
         old = _node_by_id(base, nid)
@@ -2845,6 +2924,9 @@ def _check(design: Design, base: Design, exp: dict, escalated: bool) -> str:
         if node.get("visibleIf") or node.get("opacity") == 0:
             return ""
         return f"{nid} still visible"
+    if "size_gt" in exp:  # rendered text size: explicit size, else the font (token or style)
+        size = effective_text_size(design, node)
+        return "" if size > exp["size_gt"] else f"{nid} text size {size:g}"
     prop = exp.get("prop")
     val = node.get(prop)
     if "eq" in exp:
@@ -3008,8 +3090,7 @@ def main(argv=None) -> int:
     try:
         return handlers[args.cmd](project, args)
     except Escalate as e:
-        print(f"ESCALATE: {e}\n  (not expressible in design JSON: add a Swift view in Sources/Components, "
-              f"register it, ./run.sh once, then place it with a custom node)")
+        print(f"ESCALATE: {e}\n  {ESCALATE_HINT}")
         return 3
     except UIError as e:
         print(f"error {e}", file=sys.stderr)

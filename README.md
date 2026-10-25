@@ -5,10 +5,20 @@ A Claude Code **skill** for prototyping iOS (SwiftUI) app UIs from the command l
 Scaffolded apps render their UI from JSON, and the app running in the Simulator hot-reloads
 it in about 0.2 seconds. A UI change is therefore one small, validated edit addressed by
 element id. There is no codebase to read and nothing to rebuild, so small, fast models
-(Claude Haiku) can make changes in about 1–3 s instead of minutes.
+(Claude Haiku) can make changes in about 3 s instead of minutes (measured in Claude Code).
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design.
 
 Built for Apple Silicon with **Xcode 26+ / iOS 26+**.
+
+The scaffolded demo app, captured by CI in the iOS 26 Simulator. The second shot is after one
+`./ui apply` (new title, brand color, inserted line), shown without a rebuild:
+
+<p>
+  <img src="docs/screenshots/home.png" width="200" alt="Home screen">
+  <img src="docs/screenshots/home-after-apply.png" width="200" alt="Home screen after a live ./ui apply">
+  <img src="docs/screenshots/explore.png" width="200" alt="Explore screen">
+  <img src="docs/screenshots/profile.png" width="200" alt="Profile screen">
+</p>
 
 ## Requirements
 - macOS on Apple Silicon

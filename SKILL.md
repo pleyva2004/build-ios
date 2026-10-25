@@ -31,7 +31,7 @@ ops reference (`tools/REFERENCE.md`).
 ## Which path?
 | The change | Path | Typical latency |
 |---|---|---|
-| Colors, copy, spacing, sizes, layout, new screens, navigation, demo data | **Fast path**: `./ui apply` (or `/ui`, `./ui ask`) | ~1–3 s with a small model; ~0.2 s to render |
+| Colors, copy, spacing, sizes, layout, new screens, navigation, demo data | **Fast path**: `./ui apply` (or `/ui`, `./ui ask`) | ~3 s per change with Haiku (measured in Claude Code); ~0.2 s to render |
 | Something JSON can't express (maps, charts, gestures, custom drawing/animation) | **Compile path**: add `Sources/Components/<Name>.swift`, register it in `LiveComponents.registry` + `catalog`, `./run.sh`, then place it with a `custom` node | one incremental build (~10–20 s) |
 | Changes to `Sources/Runtime/` | Only to fix a runtime bug, never for UI work | rebuild |
 
@@ -39,7 +39,7 @@ ops reference (`tools/REFERENCE.md`).
 
 ## Fast lanes for the user
 - **In Claude Code**: `/ui <change>` (a project skill in every scaffolded app). It runs one Haiku turn with the live context already injected, makes one `./ui apply --end-turn`, and a hook ends the turn. For long sessions, start `claude --model haiku` in the app folder.
-- **In a terminal**: `./ui ask "<change>"` is one direct Claude API call (needs `ANTHROPIC_API_KEY` + `uv`). `./ui ask -n 3 "<idea>"` builds 3 variants in parallel; switch with `./ui next` / `prev` / `keep`. `./ui chat` keeps the client warm.
+- **In a terminal**: `./ui ask "<change>"` is one direct Claude API call (needs `ANTHROPIC_API_KEY` + `uv`). Without a key it falls back to `claude -p` with your Claude Code login (~5 s, mostly CLI startup). `./ui ask -n 3 "<idea>"` builds 3 variants in parallel; switch with `./ui next` / `prev` / `keep`. `./ui chat` keeps the client warm.
 - **No model at all**: `./ui pick` (tap an element in the Simulator → its id), then `./ui tune` (single keys nudge size/padding/spacing/radius/weight, cycle colors and styles).
 - **Measure**: `./ui stats` prints p50/p90 for model time, write time and render confirmation. `./ui eval` runs `tools/evals.jsonl`, 24 requests with assertions on the resulting design, and reports pass rate, valid-first-try rate and latency. It makes one model call per case.
 

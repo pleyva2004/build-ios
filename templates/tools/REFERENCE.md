@@ -53,6 +53,7 @@ behavior: `onTap` (action), `visibleIf` (`"key"` · `"!key"` · `"key==value"`),
 | tokens & styles | `{"op":"token","path":"colors.brand","value":"#0EA5E9"}` · `"path":"styles.card.padding"` |
 | demo data | `{"op":"data","screen":"home","path":"stories.0.title","value":"…"}` (`"stories.-"` appends) |
 | new screen | `{"op":"screen","id":"settings","spec":{"title":"Settings","body":{...}}}` (`"spec": null` deletes it) |
+| app.json (tabs, state, tint) | `{"op":"path","file":"app","path":"tabs.0.symbol","value":"house.fill"}` · `"path":"state.plan"` · `"tabs.-"` appends a tab |
 
 New nodes may omit `id`. **Scope:** "this/it/that" → the focused element (`set`/`nudge`);
 "all cards / every button" → its **style** (`token` `styles.<name>.…`); "brand / theme /

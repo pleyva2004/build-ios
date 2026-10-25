@@ -92,7 +92,7 @@ In Claude Code a `UserPromptSubmit` hook adds this to every plain prompt and to 
 - **Variants:** `-n 3` runs three parallel calls with different design directions. The first is shown as soon as it lands; `./ui next` flips between them instantly.
 - **`/ui` in Claude Code:** a project skill with `model: haiku` and `effort: low`.
   - The context arrives through the `UserPromptSubmit` hook.
-  - The model makes exactly one `./ui apply --end-turn` call. On success a `PostToolUse` hook ends the turn (`continue: false`), so there's no second model response. An escalation (`ops: []`, exit 3) also ends the turn, via `PostToolUseFailure`. A rejected apply doesn't end it, so the model can fix the ops and retry once.
+  - The model makes exactly one `./ui apply --end-turn` call. On success a `PostToolUse` hook ends the turn (`continue: false`), so there's no second model response. An escalation (`ops: []`) also ends the turn: with `--end-turn` it exits 0 so the same hook can stop the turn with the `ESCALATE:` message (Claude Code ignores `continue: false` from `PostToolUseFailure`). A rejected apply exits 1, which doesn't end the turn, so the model can fix the ops and retry once.
   - A `PreToolUse` hook auto-approves only inert `./ui … <<'OPS'` heredocs, so there are no permission prompts.
 
 ### 7. Escalation: a clear line between "data" and "code"
@@ -112,13 +112,20 @@ The app reports its component catalog to the tooling, so models can use register
 - `simctl launch --terminate-running-process`.
 - It waits for the app's status handshake instead of `sleep 3`.
 
-## Latency budget (estimates — measure with `./ui stats`)
+## Latency budget (measure your own with `./ui stats`)
+"Measured" rows come from headless Claude Code 2.1 runs on Haiku against a scaffolded app;
+the CLI startup of a fresh `claude -p` process (~2–3 s) is not included in the in-session numbers.
+
 | Path | Model | Write + validate | App confirms | Total |
 |---|---|---|---|---|
 | `./ui tune` key (no model) | — | ~30 ms | ≤150 ms | **~0.2 s** |
-| `./ui apply` (ops given) | — | ~30 ms | ≤150 ms | **~0.2 s** |
-| `./ui chat` / `ask` (Haiku, warm) | ~0.6–1.5 s | ~30 ms | ≤150 ms | **~1–2 s** |
-| `/ui` in a Haiku Claude Code session | ~1.5–4 s | ~30 ms | ≤150 ms | **~2–5 s** |
+| `./ui apply` (ops given) | — | ~30 ms | ≤150 ms | **~0.2 s** (0.25 s + 0.22 s in CI) |
+| `/ui` in Claude Code (Haiku) | ~2 s | ~30 ms | ≤150 ms | **3.0 s measured** (2 turns, ~$0.004) |
+| plain prompt, `claude --model haiku` session | ~2.5 s | ~30 ms | ≤150 ms | **3.2 s measured** |
+| rejected op → corrected retry (`/ui`) | ~7 s | | | **9.1 s measured** (3 turns) |
+| escalation (`/ui`, needs Swift) | ~3 s | — | — | **4.2 s measured** |
+| `./ui ask` via the direct API (Haiku, warm cache) | ~0.6–1.5 s | ~30 ms | ≤150 ms | **~1–2 s** (estimate) |
+| `./ui ask` via the `claude -p` fallback | ~4.5 s | ~30 ms | ≤150 ms | **5.4 s p50 measured** (incl. CLI startup) |
 | new Swift component | — | incremental build | relaunch | ~10–20 s |
 | before this change | 30–150 s | — | build + relaunch | **1–3 min** |
 
@@ -130,7 +137,17 @@ The app reports its component catalog to the tooling, so models can use register
   - an invalid op is rejected;
   - undo restores `design/` byte-for-byte;
   - before/after screenshots are uploaded.
-- `./ui eval` measures the model itself. `tools/evals.jsonl` holds 24 natural-language requests: scope, layout, repeat template vs. row data, toolbar insert, follow-ups and must-escalate cases. Each is checked by assertions on the resulting design, and the report gives pass rate, valid-first-try rate and p50/p90 latency per model. It needs an API key and hasn't been run yet.
+- `./ui eval` measures the model itself. `tools/evals.jsonl` holds 24 natural-language requests: scope, layout, repeat template vs. row data, toolbar insert, follow-ups and must-escalate cases. Each is checked by assertions on the resulting design, and the report gives pass rate, valid-first-try rate and p50/p90 latency per model. On Haiku (through `claude -p`), all 24 produced valid ops on the first try. The first run passed 21/24, which exposed a nudge bug at the top of the radius scale and the undocumented `path` op. After those fixes, 23/24 passed, and the remaining case was a too-strict check (a larger font token is also "bigger").
+- Live Claude Code runs on a scaffolded app (with a stand-in for the Simulator that confirms renders) checked the integration:
+  - the `UserPromptSubmit` context hook;
+  - `/ui` switching to Haiku;
+  - the `PreToolUse` auto-allow for the heredoc;
+  - the turn ending after apply;
+  - a rejected op being retried;
+  - escalation ending the turn;
+  - the `PostToolUse` validator blocking a bad hand edit.
+
+  These runs also found that Claude Code ignores `continue: false` from `PostToolUseFailure` hooks, which is why escalation now ends the turn through `PostToolUse`.
 
 ## Not done yet / ideas
 - **Physical iPhone hot reload:** serve `design/` over the LAN (needs ATS `NSAllowsLocalNetworking` / IP exceptions and the Local Network permission). Today a device runs the bundled copy.
