@@ -108,6 +108,18 @@ jobs:
           ./ui status
           ./ui stats || true
 
+      - name: Print small screenshots into the log (for remote review without artifact access)
+        if: always()
+        working-directory: ${{ runner.temp }}/Demo
+        run: |
+          for f in .live/*.png; do
+            [ -f "$f" ] || continue
+            sips -Z 560 -s format jpeg -s formatOptions 50 "$f" --out "${f%.png}.small.jpg" >/dev/null
+            echo "IMG_BEGIN $(basename "$f")"
+            base64 -i "${f%.png}.small.jpg" | fold -w 900
+            echo "IMG_END"
+          done
+
       - name: Upload screenshots and logs
         if: always()
         uses: actions/upload-artifact@v4
