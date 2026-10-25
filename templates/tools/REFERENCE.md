@@ -56,8 +56,11 @@ behavior: `onTap` (action), `visibleIf` (`"key"` · `"!key"` · `"key==value"`),
 | app.json (tabs, state, tint) | `{"op":"path","file":"app","path":"tabs.0.symbol","value":"house.fill"}` · `"path":"state.plan"` · `"tabs.-"` appends a tab |
 
 **Options.** For a feeling or an open-ended ask (calmer, more premium, warmer, "try", "ideas",
-"options", "not sure"), send 3 clearly different options instead of one guess. Each is applied to the
-current design on its own; the designer flips with next / previous and says keep:
+"options", "not sure"), send 3 clearly different options instead of one guess. Make them look different
+at a glance: give each a different lever (color and contrast · type scale and weight · space and shape ·
+layout and hierarchy), plus words where they help. Three rewordings or three small nudges look the same
+on screen. Each is applied to the current design on its own; the designer flips with next / previous and
+says keep:
 `{"say":"<= 12 words","options":[{"say":"Calm: softer palette, more air","ops":[...]},{"say":"…","ops":[...]},{"say":"…","ops":[...]}]}`.
 A concrete ask ("make the title bigger") gets one change.
 

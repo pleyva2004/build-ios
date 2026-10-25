@@ -2978,8 +2978,9 @@ def ask_hint(prompt: str) -> str:
         return ("# this states a lasting preference → append it to the brief (path brief.-) and, in the same "
                 "apply, fix anything on screen that breaks it")
     if FEELING_ASK.search(prompt):
-        return ("# this is about a feeling or is open-ended → send 3 clearly different \"options\" that all "
-                "fit the brief (see Options), unless it names one exact change")
+        return ("# this is about a feeling or is open-ended → send 3 \"options\" that look different at a glance "
+                "(each a different lever: color, type, space or layout; not just words) and all fit the brief "
+                "(see Options), unless it names one exact change")
     return ""
 
 

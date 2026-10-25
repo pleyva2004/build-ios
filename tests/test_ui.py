@@ -1617,7 +1617,7 @@ class DesignerTest(ProjectCase):
         feeling = ("It feels cold and clinical", "make it more premium", "I'm not sure about the button, show me ideas",
                    "The intro sounds like a bank", "make the total feel like an achievement", "calmer please")
         for prompt in feeling:
-            self.assertIn('send 3 clearly different "options"', ui.ask_hint(prompt), prompt)
+            self.assertIn('send 3 "options" that look different at a glance', ui.ask_hint(prompt), prompt)
         for prompt in ("From now on, never use black text", "I prefer serif type", "always keep cards dark"):
             self.assertIn("lasting preference", ui.ask_hint(prompt), prompt)
         for prompt in ("make the title bigger", "rename the button to Start", "put the icon next to the name",
