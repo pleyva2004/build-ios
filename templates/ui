@@ -1965,8 +1965,9 @@ def fmt_value(v, limit: int = 70) -> str:
 
 def fmt_props(node: dict) -> str:
     keys = [k for k in PROP_ORDER if k in node] + sorted(k for k in node if k not in PROP_ORDER and k not in STRUCTURAL)
-    # actions are shown in full: a model may copy them back
-    return " ".join(f"{k}={compact(node[k]) if k in ('action', 'onTap') else fmt_value(node[k])}" for k in keys)
+    # actions are shown in full (a model may copy them back), and copy nearly so (rewrites need all of it)
+    return " ".join(f"{k}={compact(node[k]) if k in ('action', 'onTap') else fmt_value(node[k], 300 if k == 'text' else 70)}"
+                    for k in keys)
 
 
 def outline(node, depth: int = 0, lines=None, data=None) -> list:
