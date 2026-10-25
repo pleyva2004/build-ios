@@ -2960,6 +2960,28 @@ INSTANT_WORDS = {
 VARIANT_WORDS = {"next", "prev", "keep"}
 
 
+FEELING_ASK = re.compile(
+    r"\b(feel|feels|feeling|felt|vibe|mood|tone|sound|sounds|voice|wording|premium|luxur\w*|elegant|classy|"
+    r"calm\w*|warm\w*|cold|clinical|sterile|friendl\w*|playful|fun|serious|boring|bland|plain|dull|busy|"
+    r"clutter\w*|overwhelm\w*|modern|fresh|dated|trust\w*|credib\w*|reassur\w*|anxious|anxiety|stress\w*|"
+    r"judg\w*|confiden\w*|energ\w*|exciting|inviting|human|personal|harsh|achievement|celebrat\w*|"
+    r"delight\w*|polish\w*|pop|stand out|ideas|options|alternatives|explore|not sure|unsure|"
+    r"something different|surprise me|inspir\w*)\b", re.I)
+LASTING_PREF = re.compile(
+    r"\b(from now on|going forward|always|never|in general|i prefer|i hate|i don'?t like|i love it when)\b", re.I)
+
+
+def ask_hint(prompt: str) -> str:
+    """One line steering a small model toward fewer rounds for this prompt."""
+    if LASTING_PREF.search(prompt):
+        return ("# this states a lasting preference → append it to the brief (path brief.-) and, in the same "
+                "apply, fix anything on screen that breaks it")
+    if FEELING_ASK.search(prompt):
+        return ("# this is about a feeling or is open-ended → send 3 clearly different \"options\" "
+                "(see Options), unless it names one exact change")
+    return ""
+
+
 def instant_word(project: Project, prompt: str):
     """Short designer words that don't need a model: undo, redo, next, previous, keep,
     option N, select. next/previous/keep/option N only while options are on screen."""
@@ -2975,10 +2997,12 @@ def instant_word(project: Project, prompt: str):
     m = re.fullmatch(r"(?:option|number|show|try|show me)?\s*#?([1-4])", text)
     if m and options_on:
         return f"option:{int(m.group(1))}"
+    if not options_on and re.fullmatch(r"option\s*#?[1-4]", text):
+        return "nooptions:option"
     for word, phrases in INSTANT_WORDS.items():
         if text in phrases:
             if word in VARIANT_WORDS and not options_on:
-                return None
+                return "nooptions:" + word
             if word == "undo" and options_on and text in ("back", "go back"):
                 return "prev"
             return word
@@ -3004,8 +3028,11 @@ def run_instant(project: Project, word: str):
                 write_atomic(live.dir / "pick", str(time.time()))
                 return "Tap the element in the Simulator, then tell me what to change about it."
             state = live.read("variants.json")
-            if not state:
-                return None
+            if word.startswith("nooptions:") or not state:
+                if word.endswith("keep"):
+                    return "Saved. Every change stays until you say “undo”."
+                return ("There are no options on screen right now. Say how it should feel "
+                        "(like “calmer” or “more premium”) and I'll show 3 to choose from.")
             n, cur = len(state["variants"]), state.get("current", 0)
             if word == "keep":
                 cmd_keep(project, argparse.Namespace())
@@ -3063,6 +3090,9 @@ def cmd_hook(project: Project, args) -> int:
             ctx = build_context(project, request=str(payload.get("prompt", ""))[:500])
         except Exception:
             return 0
+        hint = ask_hint(prompt)
+        if hint:
+            ctx += "\n" + hint
         print(f"<ui-context note=\"live state of the prototype; UI edits go through ./ui apply\">\n{ctx}\n</ui-context>")
         return 0
     if event == "PreToolUse" and tool == "Bash":

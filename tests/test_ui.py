@@ -1568,9 +1568,11 @@ class DesignerTest(ProjectCase):
             self.assertEqual(word(prompt), "redo", prompt)
         self.assertEqual(word("select"), "select")
         self.assertEqual(word("let me pick"), "select")
-        # option words mean nothing without options on screen
-        for prompt in ("next", "previous", "keep", "this one", "option 2", "2"):
-            self.assertIsNone(word(prompt), prompt)
+        # option words without options on screen get a short explanation, not a model turn
+        expected = {"next": "nooptions:next", "previous": "nooptions:prev", "keep": "nooptions:keep",
+                    "this one": "nooptions:keep", "option 2": "nooptions:option", "2": None}
+        for prompt, want in expected.items():
+            self.assertEqual(word(prompt), want, prompt)
         for prompt in ("make the title bigger", "undo the color but keep the size", "", "   ", "x" * 60):
             self.assertIsNone(word(prompt), prompt)
         self.live.dir.mkdir(parents=True, exist_ok=True)
@@ -1603,6 +1605,28 @@ class DesignerTest(ProjectCase):
         with mock.patch.dict(os.environ, {"UI_NO_INSTANT": "1"}):
             self.assertIsNone(self.say("redo"))
         self.assertEqual(self.design_bytes(), before)
+
+    def test_option_words_without_options(self):
+        before = self.design_bytes()
+        self.assertIn("no options on screen", self.say("next"))
+        self.assertIn("no options on screen", self.say("option 2"))
+        self.assertEqual(self.say("keep that one"), "Saved. Every change stays until you say “undo”.")
+        self.assertEqual(self.design_bytes(), before)
+
+    def test_ask_hint(self):
+        feeling = ("It feels cold and clinical", "make it more premium", "I'm not sure about the button, show me ideas",
+                   "The intro sounds like a bank", "make the total feel like an achievement", "calmer please")
+        for prompt in feeling:
+            self.assertIn('send 3 clearly different "options"', ui.ask_hint(prompt), prompt)
+        for prompt in ("From now on, never use black text", "I prefer serif type", "always keep cards dark"):
+            self.assertIn("lasting preference", ui.ask_hint(prompt), prompt)
+        for prompt in ("make the title bigger", "rename the button to Start", "put the icon next to the name",
+                       "make the score label bold"):
+            self.assertEqual(ui.ask_hint(prompt), "", prompt)
+        out = self.hook({"hook_event_name": "UserPromptSubmit", "prompt": "make it feel calmer"})
+        self.assertTrue(out.rstrip().endswith('unless it names one exact change\n</ui-context>'), out[-200:])
+        out = self.hook({"hook_event_name": "UserPromptSubmit", "prompt": "make the title bigger"})
+        self.assertNotIn("options", out.split("## screen")[0])
 
     def test_select_needs_the_app(self):
         self.assertIsNone(self.say("select"))  # app not running: Claude explains
@@ -1674,7 +1698,7 @@ class DesignerTest(ProjectCase):
         self.assertEqual(self.title(), "Soft")
         self.assertEqual(self.say("keep this one"), "✓ Kept option 1: Soft")
         self.assertFalse((self.live.dir / "variants.json").exists())
-        self.assertIsNone(self.say("next"))  # options are done
+        self.assertIn("no options on screen", self.say("next"))  # options are done
         self.assertEqual(self.title(), "Soft")
         self.assertEqual(self.say("undo"), "↩ Undid: Make the greeting calmer [variant 1: Soft]")
         self.assertEqual(self.title(), base_title)

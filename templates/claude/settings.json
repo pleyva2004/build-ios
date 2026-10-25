@@ -1,5 +1,7 @@
 {
   "model": "haiku",
+  "effortLevel": "low",
+  "alwaysThinkingEnabled": false,
   "permissions": {
     "allow": [
       "Bash(./ui *)",
