@@ -136,7 +136,15 @@ struct LiveScreenView: View {
         }
         // Toolbar items are plain native buttons (no overlays) so the system can
         // render them as standard bar buttons.
-        let items = screen.toolbar.map { LiveRenderItem(id: $0.id, node: $0, scope: scope) }
+        // Hidden items are dropped here: an empty AnyView would still take a bar slot.
+        let liveStore = store
+        let items = screen.toolbar
+            .filter { node in
+                let p = theme.effectiveProps(node.props)
+                guard let condition = theme.text(p["visibleIf"]) else { return true }
+                return liveStore.isVisible(condition)
+            }
+            .map { LiveRenderItem(id: $0.id, node: $0, scope: scope) }
         let leading = items.filter { ($0.node.props["placement"] as? String) == "leading" }
         let trailing = items.filter { ($0.node.props["placement"] as? String) != "leading" }
         if !leading.isEmpty {

@@ -25,6 +25,7 @@ SHOT=1
 DEVICE_ARG=""
 for arg in "$@"; do
   case "$arg" in
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     --launch|--no-build) BUILD=0 ;;
     --no-shot) SHOT=0 ;;
     *) DEVICE_ARG="$arg" ;;
@@ -37,18 +38,42 @@ case "$PROJECT_DIR" in
     echo "   design/, which turns hot reload off. Move it to e.g. ~/Code." ;;
 esac
 
-# --- 1. Simulator: named > last used > already booted > iPhone 17 Pro > first iPhone
-udid_named() { xcrun simctl list devices available | grep -F "$1 (" | head -1 | grep -oE '[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}' || true; }
+# --- 1. Simulator (iOS 26+ only — the deployment target):
+#        named > last used > already booted > iPhone 17 Pro > newest iPhone
+DEVICES_JSON="$(xcrun simctl list devices available -j)"
+pick() {  # pick <name or ""> <booted-only 0|1> [udid]  -> UDID of the newest matching iOS 26+ iPhone
+  printf '%s' "$DEVICES_JSON" | python3 -c '
+import json, re, sys
+name, booted, want = sys.argv[1], sys.argv[2] == "1", (sys.argv[3] if len(sys.argv) > 3 else "")
+best = None
+for runtime, devices in json.load(sys.stdin)["devices"].items():
+    m = re.search(r"iOS-(\d+)-(\d+)", runtime)
+    if not m or int(m.group(1)) < 26:
+        continue
+    version = (int(m.group(1)), int(m.group(2)))
+    for d in devices:
+        if want and d["udid"] != want:
+            continue
+        if not want and not d["name"].startswith("iPhone"):
+            continue
+        if name and d["name"] != name:
+            continue
+        if booted and d["state"] != "Booted":
+            continue
+        if best is None or version > best[0]:
+            best = (version, d["udid"])
+print(best[1] if best else "")' "$1" "$2" "${3:-}"
+}
 UDID=""
-[ -n "$DEVICE_ARG" ] && UDID="$(udid_named "$DEVICE_ARG")"
-if [ -z "$UDID" ] && [ -f "$LIVE/device" ]; then
-  cached="$(cat "$LIVE/device")"
-  xcrun simctl list devices available | grep -q "$cached" && UDID="$cached"
+if [ -n "$DEVICE_ARG" ]; then
+  UDID="$(pick "$DEVICE_ARG" 0)"
+  [ -n "$UDID" ] || { echo "No available iOS 26+ simulator named '$DEVICE_ARG' (see: xcrun simctl list devices available)"; exit 1; }
 fi
-[ -z "$UDID" ] && UDID="$(xcrun simctl list devices booted | grep -E '^\s+iPhone' | head -1 | grep -oE '[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}' || true)"
-[ -z "$UDID" ] && UDID="$(udid_named "iPhone 17 Pro")"
-[ -z "$UDID" ] && UDID="$(xcrun simctl list devices available | grep -E '^\s+iPhone' | head -1 | grep -oE '[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}' || true)"
-[ -n "$UDID" ] || { echo "No iPhone simulator found — run scripts/doctor.sh from the build-ios skill."; exit 1; }
+[ -z "$UDID" ] && [ -f "$LIVE/device" ] && UDID="$(pick "" 0 "$(cat "$LIVE/device")")"
+[ -z "$UDID" ] && UDID="$(pick "" 1)"
+[ -z "$UDID" ] && UDID="$(pick "iPhone 17 Pro" 0)"
+[ -z "$UDID" ] && UDID="$(pick "" 0)"
+[ -n "$UDID" ] || { echo "No iOS 26+ iPhone simulator found — run scripts/doctor.sh from the build-ios skill."; exit 1; }
 echo "$UDID" > "$LIVE/device"
 
 # --- 2. Boot in the background so it overlaps the build

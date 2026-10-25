@@ -55,7 +55,7 @@ A compact block, about 1–3k tokens for a demo app. It contains:
 - text→id matches for quoted text in the request;
 - the last few edits, so "a bit bigger" has a referent.
 
-In Claude Code a `UserPromptSubmit` hook adds this to every prompt, and `/ui` injects it. Either way the model needs **zero exploratory tool calls**.
+In Claude Code a `UserPromptSubmit` hook adds this to every plain prompt and to `/ui`, so the model needs **zero exploratory tool calls**. The hook doesn't depend on the session's working directory, and it includes the text→id matches.
 
 ### 4. Edits are tiny, id-addressed ops (`./ui apply`)
 - **Ops:** `set`, `nudge`, `insert`, `remove`, `move`, `wrap`, `unwrap`, `replace`, `token`, `data`, `screen`.
@@ -91,8 +91,8 @@ In Claude Code a `UserPromptSubmit` hook adds this to every prompt, and `/ui` in
 - **`./ui ask`:** one Claude API call. Defaults: `claude-haiku-5-5`, thinking off, effort low, JSON reply `{"say", "ops"}`. The static prefix (rules + reference) is prompt-cached for 1 h, and `chat` pre-warms the cache.
 - **Variants:** `-n 3` runs three parallel calls with different design directions. The first is shown as soon as it lands; `./ui next` flips between them instantly.
 - **`/ui` in Claude Code:** a project skill with `model: haiku` and `effort: low`.
-  - The context arrives through `!`./ui context``.
-  - The model makes exactly one `./ui apply --end-turn` call. A `PostToolUse` hook then ends the turn (`continue: false`), so there's no second model response.
+  - The context arrives through the `UserPromptSubmit` hook.
+  - The model makes exactly one `./ui apply --end-turn` call. On success a `PostToolUse` hook ends the turn (`continue: false`), so there's no second model response. An escalation (`ops: []`, exit 3) also ends the turn, via `PostToolUseFailure`. A rejected apply doesn't end it, so the model can fix the ops and retry once.
   - A `PreToolUse` hook auto-approves only inert `./ui … <<'OPS'` heredocs, so there are no permission prompts.
 
 ### 7. Escalation: a clear line between "data" and "code"
@@ -124,7 +124,12 @@ The app reports its component catalog to the tooling, so models can use register
 
 ## Verification
 - `tests/test_ui.py` covers every op, the auto-fixes, validation, undo, the live handshake, hooks, `ask` with a fake model, and a drift test between the Swift renderer, the validator and `REFERENCE.md`.
-- `.github/workflows/ios.yml` compiles a scaffolded app on a macOS runner and runs a Simulator smoke test: launch → live link → `./ui apply` → confirmed revision → undo, with before/after screenshots.
+- `.github/workflows/ios.yml` compiles a scaffolded app on a macOS runner (Xcode 26.6) and runs a Simulator smoke test:
+  - launch → app reports a live link;
+  - `./ui apply` → the app confirms the revision (0.47 s in CI);
+  - an invalid op is rejected;
+  - undo restores `design/` byte-for-byte;
+  - before/after screenshots are uploaded.
 - `./ui eval` measures the model itself. `tools/evals.jsonl` holds 24 natural-language requests: scope, layout, repeat template vs. row data, toolbar insert, follow-ups and must-escalate cases. Each is checked by assertions on the resulting design, and the report gives pass rate, valid-first-try rate and p50/p90 latency per model. It needs an API key and hasn't been run yet.
 
 ## Not done yet / ideas

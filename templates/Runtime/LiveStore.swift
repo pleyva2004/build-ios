@@ -224,8 +224,11 @@ final class LiveStore: ObservableObject {
         } else if !next.tabs.contains(where: { $0.id == selectedTab }) {
             selectedTab = next.tabs[0].id
         }
+        // Only a new revision flashes its changed ids (hand edits, or a tick that
+        // lands between the design write and the rev write, don't re-flash).
+        let isNewRev = rev != appliedRev
         appliedRev = rev
-        flash(changed)
+        if isNewRev { flash(changed) }
         statusDirty()
     }
 

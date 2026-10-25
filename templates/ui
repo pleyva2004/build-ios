@@ -2438,6 +2438,7 @@ def cmd_status(project: Project, args) -> int:
     print(f"app      {'running' if alive else 'not running'} (pid {st.get('pid')})")
     print(f"screen   {st.get('screen')}   stack: {' › '.join(st.get('stack') or [])}")
     print(f"rev      {st.get('rev')}")
+    print(f"source   {st.get('source')}  ({st.get('designDir')})  — env/defaults/source = hot reload on")
     if st.get("error"):
         print(f"error    {st['error']}")
     if st.get("selected"):
@@ -2623,7 +2624,10 @@ def inert_ui_command(cmd: str) -> bool:
     """True for `./ui <cmd> [simple args]` optionally followed by a quoted heredoc whose
     body (inert data: quoted heredocs are not expanded) ends at the very last line."""
     lines = cmd.rstrip("\n").split("\n")
-    # only bash's own blanks: \r, \v, \f would stay in the delimiter word ('OPS'\r ends at "OPS\r")
+    # The first line must be printable ASCII: \r, \v, \f, NBSP etc. would stay in bash's
+    # delimiter word ('OPS'\r ends at "OPS\r") and let a later line run as a command.
+    if any(not (" " <= ch <= "~") and ch != "\t" for ch in lines[0]):
+        return False
     m = HEREDOC_FIRST.match(lines[0].strip(" \t"))
     if not m:
         return False
@@ -2650,7 +2654,9 @@ def cmd_hook(project: Project, args) -> int:
     ti = payload.get("tool_input") or {}
     if event == "UserPromptSubmit":
         prompt = str(payload.get("prompt", "")).lstrip()
-        if os.environ.get("UI_NO_CONTEXT_HOOK") or prompt.startswith("/"):
+        # The hook owns context for plain prompts and /ui (cwd-independent, includes
+        # text->id mentions); other slash commands get nothing.
+        if os.environ.get("UI_NO_CONTEXT_HOOK") or (prompt.startswith("/") and not re.match(r"/ui\b", prompt)):
             return 0  # slash commands (e.g. /ui) inject their own context
         try:
             ctx = build_context(project, request=str(payload.get("prompt", ""))[:500])
@@ -2665,6 +2671,16 @@ def cmd_hook(project: Project, args) -> int:
         return 0
     if event == "PostToolUse" and tool in ("Edit", "Write", "MultiEdit"):
         return cmd_validate(project, argparse.Namespace(hook=True, hook_payload=payload))
+    if event == "PostToolUseFailure" and tool == "Bash":
+        # /ui escalation (ops: [] -> exit 3) also ends the turn; other failures don't,
+        # so the model can still fix rejected ops and retry once.
+        first = str(ti.get("command", "")).split("\n")[0]
+        err = str(payload.get("error", "")) + str(payload.get("tool_response", ""))
+        if first.startswith("./ui apply") and "--end-turn" in first and "ESCALATE:" in err:
+            line = next((l for l in err.splitlines() if "ESCALATE:" in l), "ESCALATE")
+            msg = line[line.index("ESCALATE:"):].strip()
+            print(compact({"continue": False, "stopReason": f"{msg} (needs a Swift component — see CLAUDE.md)"}))
+        return 0
     if event == "PostToolUse" and tool == "Bash":
         first = str(ti.get("command", "")).split("\n")[0]
         if first.startswith("./ui apply") and "--end-turn" in first:
@@ -2850,6 +2866,8 @@ def cmd_eval(project: Project, args) -> int:
     import tempfile
 
     cases_path = Path(args.file) if args.file else project.root / "tools" / "evals.jsonl"
+    if not cases_path.exists():
+        raise UIError(f"no eval cases at {cases_path}")
     cases = [json.loads(l) for l in cases_path.read_text(encoding="utf-8").splitlines() if l.strip()]
     if args.only:
         cases = [c for c in cases if args.only.lower() in c.get("name", "").lower()]

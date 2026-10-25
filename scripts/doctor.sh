@@ -43,7 +43,12 @@ iphone="$(xcrun simctl list devices available 2>/dev/null | grep -oE 'iPhone [^(
 
 echo
 echo "-- CLI tooling (Homebrew) --"
-for t in xcodegen xcbeautify swiftlint swiftformat aria2c fastlane; do
+if command -v xcodegen >/dev/null 2>&1; then
+  echo "OK   xcodegen -> $(command -v xcodegen)"
+else
+  echo "FAIL xcodegen missing (run.sh needs it)  ->  brew install xcodegen"
+fi
+for t in xcbeautify swiftlint swiftformat aria2c fastlane; do
   if command -v "$t" >/dev/null 2>&1; then
     echo "OK   $t -> $(command -v "$t")"
   else
@@ -54,7 +59,7 @@ done
 echo
 echo "-- Live-UI fast path (optional, for ./ui ask / ./ui chat) --"
 if command -v python3 >/dev/null 2>&1; then
-  echo "OK   python3 $(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))') (./ui core needs 3.7+)"
+  echo "OK   python3 $(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))') (./ui core needs 3.9+, the python3 macOS ships)"
 else
   echo "FAIL python3 missing  ->  xcode-select --install"
 fi

@@ -25,7 +25,7 @@ struct LiveProps {
         guard let d = number(key), d.isFinite, abs(d) < 1_000_000 else { return nil }
         return Int(d)
     }
-    func bool(_ key: String) -> Bool? { LiveJSON.bool(raw[key]) }
+    func bool(_ key: String) -> Bool? { LiveJSON.bool(theme.text(raw[key])) }
     func color(_ key: String) -> Color? { theme.color(raw[key]) }
 
     /// Runs the action stored in `key` (same format as a button's "action").

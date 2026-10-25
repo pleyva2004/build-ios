@@ -71,7 +71,9 @@ jobs:
           xcrun simctl install "$UDID" build/Build/Products/Debug-iphonesimulator/Demo.app
           SIMCTL_CHILD_UI_PROJECT_DIR="$PWD" xcrun simctl launch "$UDID" com.example.Demo -UIProjectDir "$PWD"
           for i in $(seq 1 150); do [ -f .live/status.json ] && break; sleep 0.2; done
+          [ -f .live/status.json ] || { echo "app never wrote .live/status.json: not live (bundled design) or not launched"; exit 1; }
           cat .live/status.json
+          BEFORE="$(cat design/*.json design/screens/*.json | shasum)"
           ./ui status
           sleep 4
           t 60 xcrun simctl io "$UDID" screenshot .live/1-launch.png || echo "screenshot timed out"
@@ -89,8 +91,9 @@ jobs:
           # 2) invalid ops are rejected before they reach the app (exit 1)
           if ./ui apply '{"op":"set","id":"nope","props":{"text":"x"}}'; then echo "invalid op was accepted"; exit 1; fi
 
-          # 3) undo restores the design
+          # 3) undo restores the design byte-for-byte
           ./ui undo
+          [ "$(cat design/*.json design/screens/*.json | shasum)" = "$BEFORE" ] || { echo "undo did not restore design/"; exit 1; }
           sleep 1
           t 60 xcrun simctl io "$UDID" screenshot .live/3-after-undo.png || echo "screenshot timed out"
 

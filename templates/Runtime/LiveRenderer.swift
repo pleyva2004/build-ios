@@ -25,7 +25,8 @@ struct LiveNodeView: View {
 extension LiveNodeView {
     static let containerTypes: Set<String> = ["vstack", "hstack", "zstack", "scroll", "grid", "list", "section", "repeat"]
     static let buttonVariants: Set<String> = ["primary", "secondary", "plain", "borderless", "destructive", "glass", "glassProminent"]
-    static let systemButtonVariants: Set<String> = ["primary", "secondary", "destructive", "glass", "glassProminent"]
+    /// Variants drawn by a bordered system style (they take tint + border shape).
+    static let systemButtonVariants: Set<String> = ["primary", "secondary", "glass", "glassProminent"]
 
     func makeTheme(_ scope: LiveScope) -> LiveTheme {
         LiveTheme(tokens: store.spec.tokens, dark: colorScheme == .dark, scope: scope)
@@ -62,7 +63,7 @@ extension LiveNodeView {
         var seen = Set<String>()
         for child in children {
             if child.type == "repeat" {
-                guard let template = child.template else { continue }
+                guard isShown(child, in: scope), let template = child.template else { continue }
                 let items = repeatItems(child, scope)
                 for (i, element) in items.enumerated() {
                     var s = scope

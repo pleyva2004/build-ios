@@ -1269,8 +1269,11 @@ class HookTest(ProjectCase):
         self.assertIn('"Latest" → home.section', out)
         with mock.patch.dict(os.environ, {"UI_NO_CONTEXT_HOOK": "1"}):
             self.assertEqual(self.hook({"hook_event_name": "UserPromptSubmit", "prompt": "x"})[1], "")
-        # slash commands (/ui) inject their own context
-        self.assertEqual(self.hook({"hook_event_name": "UserPromptSubmit", "prompt": " /ui make it blue"})[1], "")
+        # /ui gets the context (with mentions); other slash commands get nothing
+        out = self.hook({"hook_event_name": "UserPromptSubmit", "prompt": ' /ui make "Latest" blue'})[1]
+        self.assertIn('"Latest" → home.section', out)
+        self.assertEqual(self.hook({"hook_event_name": "UserPromptSubmit", "prompt": "/help"})[1], "")
+        self.assertEqual(self.hook({"hook_event_name": "UserPromptSubmit", "prompt": "/uix"})[1], "")
 
     def test_pre_tool_use_allows_inert_ui_commands(self):
         allowed = [
@@ -1307,9 +1310,30 @@ class HookTest(ProjectCase):
             "./ui apply <<'OPS'\r\n{}\r\nOPS\r\nrm -rf x\nOPS",
             "./ui apply <<'OPS'\x0b\n{}\nOPS\x0b\nrm -rf x\nOPS",
             "./ui apply <<'OPS'\x0c\n{}\nOPS\x0c\nrm -rf x\nOPS",
+            "./ui apply <<'OPS'\u00a0\n{}\nOPS\u00a0\nrm -rf x\nOPS",    # NBSP
+            "./ui apply <<'OPS'\x1f\n{}\nOPS\x1f\nrm -rf x\nOPS",
+            "./ui apply <<'OPS'\u2003\n{}\nOPS\u2003\nrm -rf x\nOPS",    # em space
         ]
         for cmd in denied:
             self.assertFalse(self.pre_bash(cmd), repr(cmd))
+
+    def test_escalation_ends_the_turn_but_other_failures_do_not(self):
+        cmd = "./ui apply --end-turn <<'OPS'\n{\"say\": \"maps need Swift\", \"ops\": []}\nOPS"
+        code, out, _ = self.hook({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+                                  "tool_input": {"command": cmd},
+                                  "error": "Exit code 3\nESCALATE: maps need Swift\n  (not expressible...)"})
+        self.assertEqual(code, 0)
+        stop = json.loads(out)
+        self.assertIs(stop["continue"], False)
+        self.assertIn("ESCALATE: maps need Swift", stop["stopReason"])
+        # a rejected apply (exit 1) must let the model retry
+        self.assertEqual(self.hook({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+                                    "tool_input": {"command": cmd},
+                                    "error": "Exit code 1\nerror rejected, nothing was written"})[1], "")
+        # without --end-turn nothing happens
+        self.assertEqual(self.hook({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+                                    "tool_input": {"command": cmd.replace(" --end-turn", "")},
+                                    "error": "Exit code 3\nESCALATE: x"})[1], "")
 
     def test_other_tools_and_bad_payloads_are_ignored(self):
         self.assertEqual(self.hook({"hook_event_name": "PreToolUse", "tool_name": "Read",

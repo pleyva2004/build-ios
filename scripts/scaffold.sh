@@ -12,9 +12,10 @@ RAW="${1:?Usage: scaffold.sh <AppName> [parent-dir] [bundle-prefix]}"
 PARENT="${2:-$PWD}"
 PREFIX="${3:-com.example}"
 
-APP_NAME="$(printf '%s' "$RAW" | tr -cd '[:alnum:]')"
+APP_NAME="$(printf '%s' "$RAW" | LC_ALL=C tr -cd 'A-Za-z0-9')"   # ASCII only: bundle ids allow A-Z a-z 0-9 . -
 [ -n "$APP_NAME" ] || { echo "ERROR: app name must contain letters/digits"; exit 1; }
 case "$APP_NAME" in [0-9]*) APP_NAME="App$APP_NAME" ;; esac   # Swift type names can't start with a digit
+case "$PREFIX" in ''|*[!A-Za-z0-9.-]*) echo "ERROR: bundle prefix may only contain letters, digits, '.' and '-'"; exit 1 ;; esac
 
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TPL="$SKILL_DIR/templates"
@@ -37,7 +38,7 @@ cp "$TPL"/Components/*.swift "$DEST/Sources/Components/"
 cp -R "$TPL/design" "$DEST/design"
 subst "$TPL/design/app.json" > "$DEST/design/app.json"
 cp "$TPL/ui" "$DEST/ui"
-cp "$TPL/tools/REFERENCE.md" "$DEST/tools/REFERENCE.md"
+cp "$TPL/tools/REFERENCE.md" "$TPL/tools/evals.jsonl" "$DEST/tools/"
 subst "$TPL/run.sh" > "$DEST/run.sh"
 chmod +x "$DEST/run.sh" "$DEST/ui"
 

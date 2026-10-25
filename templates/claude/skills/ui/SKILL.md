@@ -8,12 +8,11 @@ allowed-tools: Bash(./ui *)
 ---
 Change the live prototype's UI: $ARGUMENTS
 
-Live state (current screen outline, tokens, picked element, recent edits):
-
-!`./ui context`
-
-The node types, props and ops are in CLAUDE.md (tools/REFERENCE.md). Do not read or
-search any files. Reply with exactly one Bash call and no other text:
+The live state (current screen outline, tokens, picked element, recent edits, and
+which ids the request mentions) is in the `<ui-context>` block added to this prompt.
+If there is no such block, run `./ui context` once first. The node types, props and
+ops are in CLAUDE.md (tools/REFERENCE.md). Do not read or search any other files.
+Reply with exactly one Bash call and no other text:
 
 ./ui apply --end-turn <<'OPS'
 {"say": "<= 12 words: what changes", "ops": [ ... ]}
