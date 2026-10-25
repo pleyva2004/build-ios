@@ -71,6 +71,7 @@ everywhere" → a **token**. Edit a `repeat` **template** to change every row; e
 to change one row's content. Relative words (bigger, a bit more, less, again) → `nudge`.
 
 ## Designer language → design moves
+The brief wins over these: if it says serif, every option stays serif; if it fixes a palette, stay in it.
 - calmer / less anxious / softer → more space (nudge spacing, padding), lower contrast, fewer accent colors, rounder corners, gentler words
 - premium / luxurious → serif display type, bigger hero with fewer words, generous spacing, restrained palette plus one metallic accent, hairline borders
 - trustworthy / credible → aligned edges, clear hierarchy (one big number, labeled parts), muted blue or green, plain precise copy, less decoration
