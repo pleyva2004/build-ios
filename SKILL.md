@@ -22,6 +22,8 @@ description: Scaffold, run, and iterate on iOS (SwiftUI) UI prototypes from the 
    ```
    It validates, writes atomically, waits until the running app confirms the new
    revision (~0.2 s), and prints what changed. `./ui undo` reverts.
+5. **Graduate** (when the design is settled): `./ui eject` writes a standalone SwiftUI
+   app (plain code, no JSON runtime) next to the prototype. See "Ejecting" below.
 
 **Never explore the app's code to make a UI change.** Get the whole picture with
 `./ui context`: the current screen's element tree with ids, design tokens, the
@@ -43,6 +45,19 @@ ops reference (`tools/REFERENCE.md`).
 - **No model at all**: `./ui pick` (tap an element in the Simulator → its id), then `./ui tune` (single keys nudge size/padding/spacing/radius/weight, cycle colors and styles).
 - **Measure**: `./ui stats` prints p50/p90 for model time, write time and render confirmation. `./ui eval` runs `tools/evals.jsonl`, 24 requests with assertions on the resulting design, and reports pass rate, valid-first-try rate and latency. It makes one model call per case.
 
+## Ejecting to plain SwiftUI
+`./ui eject [--out DIR]` turns `design/` into a separate Xcode project (default
+`../<Name>SwiftUI`) that a developer can own:
+- one `<Screen>Screen.swift` view per screen, translated with the runtime's modifier order so it looks the same;
+- `Theme.swift` (`Color.<token>` with light/dark, `Theme.Fonts`, `Theme.Spacing`, `Theme.Radius`, `Theme.Shadows`);
+- `AppState` (toggles, fields, pickers, `set` targets), `Router` (tabs, a `Route` enum with params, sheet, alerts);
+- sample data as typed structs, inlined in each screen.
+
+The prototype stays as it is, so keep iterating and re-eject; files changed by hand in the
+ejected project are never overwritten (`--force` to do it anyway). `custom` components
+become placeholders listed in its README ("Left to do"): port them by hand. `./run.sh` in
+the ejected folder builds and launches it (`./run.sh -initialTab explore` opens a tab).
+
 ## Key facts & gotchas
 - **Hot reload needs the project folder readable by the Simulator.** Keep projects out of `~/Documents`, `~/Desktop`, `~/Downloads` and iCloud Drive, which macOS privacy protection may block. `./ui status` shows `source` (env/defaults/source = live). If it says the app hasn't reported while the app is on screen, the app is running its bundled `design/` copy and hot reload is off.
 - **Build with `-destination 'generic/platform=iOS Simulator'` plus `ARCHS=arm64`.** The generic destination always resolves, even right after a runtime install, but it builds every simulator arch unless `ARCHS` is set. `run.sh` does both, skips indexing, reuses the XcodeGen cache, and boots the Simulator while it builds.
@@ -57,6 +72,7 @@ ops reference (`tools/REFERENCE.md`).
 ./ui context                  # what a model needs to know (current screen, ids, tokens, focus)
 ./ui validate                 # check design/*.json
 ./ui shot --small             # Simulator screenshot (+ ~900px JPEG)
+./ui eject                    # standalone SwiftUI app from the design (../<Name>SwiftUI)
 ./run.sh --launch             # relaunch without building
 xcrun simctl list devices available
 ```

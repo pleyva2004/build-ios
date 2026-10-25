@@ -46,6 +46,10 @@ cd ~/Code/MyApp && ./run.sh                      # build + launch once
 ./ui undo
 ./ui eval                                        # model accuracy + latency on 24 sample requests
 claude --model haiku                             # then: /ui add a settings screen
+
+# when the design is settled: plain SwiftUI, no JSON runtime
+./ui eject                                       # writes ../MyAppSwiftUI (re-run any time)
+cd ../MyAppSwiftUI && ./run.sh
 ```
 
 ## Layout
@@ -62,11 +66,13 @@ build-ios/
 │   ├── design/              # starter UI: app.json, tokens.json, screens/*.json
 │   ├── ui                   # CLI: context / apply / undo / pick / ask / tune / stats / hook
 │   ├── tools/REFERENCE.md   # node + ops reference (what models read)
+│   ├── tools/eject.py       # design → standalone SwiftUI app (./ui eject)
 │   ├── CLAUDE.md, claude/   # per-app Claude Code rules, /ui skill, hooks
 │   ├── run.sh, project.yml  # lean build + launch; XcodeGen spec
 │   └── App.swift
 ├── tests/test_ui.py         # engine tests + Swift/validator drift test
-└── .github/workflows/ios.yml# compiles the template + Simulator hot-reload smoke test
+├── tests/test_eject.py      # design → SwiftUI translation tests
+└── .github/workflows/ios.yml# compiles the template, Simulator hot-reload smoke test, builds + compares the ejected app
 ```
 
 ## License

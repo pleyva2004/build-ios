@@ -112,6 +112,25 @@ The app reports its component catalog to the tooling, so models can use register
 - `simctl launch --terminate-running-process`.
 - It waits for the app's status handshake instead of `sleep 3`.
 
+### 9. Graduating: `./ui eject` writes the same UI as plain SwiftUI
+Prototyping speed comes from the UI being data. Shipping usually wants code a developer owns.
+`tools/eject.py` turns `design/` into a separate Xcode project with no JSON runtime:
+- **Screens:** each node becomes the SwiftUI view the runtime would build, with modifiers in
+  the same order as `LiveRenderer` (text → layout → decoration → behavior). Buttons, toolbars
+  and screen chrome follow the same rules.
+- **Tokens:** they become named constants (`Color.brand` with light/dark variants,
+  `Theme.Spacing.md`, `Theme.Fonts.title`), so the code reads like a design system rather
+  than numbers.
+- **Data, state and navigation:**
+  - sample data becomes typed structs;
+  - bound, toggled and set keys become `@Published` properties on `AppState`;
+  - navigation becomes a `Route` enum (one case per pushed or presented screen, with
+    optional params) on a `Router`.
+- **Type-checking:** big containers become computed properties and repeat templates become
+  functions, which keeps the SwiftUI type checker fast.
+- **Re-ejecting:** a manifest of file hashes means re-ejecting never overwrites hand edits.
+- **CI:** CI builds the ejected demo app and compares its screenshots with the prototype's.
+
 ## Latency budget (measure your own with `./ui stats`)
 "Measured" rows come from headless Claude Code 2.1 runs on Haiku against a scaffolded app;
 the CLI startup of a fresh `claude -p` process (~2–3 s) is not included in the in-session numbers.
@@ -153,4 +172,4 @@ the CLI startup of a fresh `claude -p` process (~2–3 s) is not included in the
 - **Physical iPhone hot reload:** serve `design/` over the LAN (needs ATS `NSAllowsLocalNetworking` / IP exceptions and the Local Network permission). Today a device runs the bundled copy.
 - **Swift-level hot reload** (InjectionNext) for custom components, instead of a rebuild.
 - **Log quick undos** as failure labels and grow the eval set from them.
-- **"Eject"** a settled design to handwritten SwiftUI, if a prototype graduates to a real app.
+- **Eject custom components** too: today a `custom` node becomes a placeholder in the ejected app.

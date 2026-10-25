@@ -34,5 +34,10 @@ For maps, charts, gestures, custom drawing or animation:
   then `./ui next`, `./ui chat`, `./ui pick` (tap an element), `./ui tune` (no model:
   keys nudge size, padding, color), `./ui stats` (latency).
 
+## Graduating to plain SwiftUI
+`./ui eject` writes a standalone SwiftUI app (no JSON runtime) to `../<Name>SwiftUI`.
+Use it when the user wants "real code" or to hand the design to developers. Re-run it after
+more design changes; it never overwrites files edited in the ejected project.
+
 ## Reference (node types, props, ops)
 @tools/REFERENCE.md
