@@ -1522,6 +1522,224 @@ class HookTest(ProjectCase):
         self.assertEqual(self.post_bash("./ui apply --end-turn <<'OPS'\n{}\nOPS"), (0, "", ""))
 
 
+class DesignerTest(ProjectCase):
+    """The designer loop: instant words (no model), redo, options, the brief, round stats."""
+
+    def hook(self, payload):
+        stdin = io.StringIO(json.dumps(payload))
+        with mock.patch.object(sys, "stdin", stdin), captured() as (out, _):
+            code = ui.cmd_hook(self.project, argparse.Namespace())
+        self.assertEqual(code, 0)
+        return out.getvalue()
+
+    def say(self, prompt):
+        """A designer prompt; returns the instant reply, or None if it would reach Claude."""
+        out = self.hook({"hook_event_name": "UserPromptSubmit", "prompt": prompt})
+        if out.startswith("{"):
+            reply = json.loads(out)
+            self.assertIs(reply["continue"], False)
+            return reply["stopReason"]
+        self.assertIn("<ui-context", out)
+        return None
+
+    def title(self):
+        return self.node("home.hero.title").get("text")
+
+    def options_envelope(self):
+        return {"say": "Make the greeting calmer", "options": [
+            {"say": "Soft", "ops": [{"op": "set", "id": "home.hero.title", "props": {"text": "Soft"}}]},
+            {"say": "Airy", "ops": [{"op": "set", "id": "home.hero.title", "props": {"text": "Airy"}}]},
+            {"say": "Broken", "ops": [{"op": "set", "id": "no.such.id", "props": {"text": "x"}}]},
+        ]}
+
+    def apply_cli(self, envelope, end_turn=True):
+        args = argparse.Namespace(ops=json.dumps(envelope), note=None, end_turn=end_turn, no_wait=True, shot=False)
+        with captured() as (out, _):
+            code = ui.cmd_apply(self.project, args)
+        return code, out.getvalue()
+
+    # instant words ---------------------------------------------------------
+
+    def test_instant_word_mapping(self):
+        word = lambda p: ui.instant_word(self.project, p)
+        for prompt in ("undo", "Undo.", "please undo", "ok, undo that!", "/ui undo", "go back", "Revert it"):
+            self.assertEqual(word(prompt), "undo", prompt)
+        for prompt in ("redo", "Put it back", "bring it back"):
+            self.assertEqual(word(prompt), "redo", prompt)
+        self.assertEqual(word("select"), "select")
+        self.assertEqual(word("let me pick"), "select")
+        # option words mean nothing without options on screen
+        for prompt in ("next", "previous", "keep", "this one", "option 2", "2"):
+            self.assertIsNone(word(prompt), prompt)
+        for prompt in ("make the title bigger", "undo the color but keep the size", "", "   ", "x" * 60):
+            self.assertIsNone(word(prompt), prompt)
+        self.live.dir.mkdir(parents=True, exist_ok=True)
+        (self.live.dir / "variants.json").write_text("{}", encoding="utf-8")
+        expected = {"next": "next", "Another one": "next", "previous": "prev", "go back": "prev",
+                    "back": "prev", "undo": "undo", "option 2": "option:2", "#3": "option:3", "2": "option:2",
+                    "show me 1": "option:1", "keep this one": "keep", "Let’s go with this.": "keep",
+                    "I like that one": "keep", "option 7": None}
+        for prompt, want in expected.items():
+            self.assertEqual(word(prompt), want, prompt)
+
+    def test_undo_and_redo_are_instant_and_logged(self):
+        before = self.design_bytes()
+        self.apply({"op": "set", "id": "home.hero.title", "props": {"text": "Changed"}}, note="new title")
+        after = self.design_bytes()
+        t0 = time.perf_counter()
+        reply = self.say("undo")
+        self.assertLess(time.perf_counter() - t0, 1.0, "no app running, so nothing to wait for")
+        self.assertEqual(reply, "↩ Undid: new title")
+        self.assertEqual(self.design_bytes(), before)
+        self.assertEqual(self.say("Redo that."), "↪ Redid: new title")
+        self.assertEqual(self.design_bytes(), after)
+        self.assertEqual(self.say("redo"), "Nothing to redo.")
+        self.assertEqual(self.say("undo"), "↩ Undid: new title")
+        self.assertEqual(self.say("undo"), "Nothing to undo.")
+        self.assertIsNone(self.say("make the title bigger"))
+        lines = [json.loads(l) for l in (self.live.dir / "prompts.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([l["instant"] for l in lines], ["undo", "redo", "redo", "undo", "undo", None])
+        # the escape hatch sends every word to Claude
+        with mock.patch.dict(os.environ, {"UI_NO_INSTANT": "1"}):
+            self.assertIsNone(self.say("redo"))
+        self.assertEqual(self.design_bytes(), before)
+
+    def test_select_needs_the_app(self):
+        self.assertIsNone(self.say("select"))  # app not running: Claude explains
+        self.assertFalse((self.live.dir / "pick").exists())
+        self.live.dir.mkdir(parents=True, exist_ok=True)
+        ui.write_atomic(self.live.dir / "status.json", json.dumps({"pid": os.getpid(), "rev": 0}))
+        self.assertIn("Tap the element", self.say("select"))
+        self.assertTrue((self.live.dir / "pick").exists())
+
+    # redo ------------------------------------------------------------------
+
+    def redo(self, steps=1):
+        with captured() as (out, _):
+            code = ui.cmd_redo(self.project, argparse.Namespace(steps=steps))
+        return code, out.getvalue()
+
+    def undo(self, steps=1):
+        with captured():
+            return ui.cmd_undo(self.project, argparse.Namespace(steps=steps))
+
+    def test_redo_steps_and_undo_after_redo(self):
+        base = self.design_bytes()
+        self.apply({"op": "set", "id": "home.hero.title", "props": {"text": "One"}}, note="one")
+        one = self.design_bytes()
+        self.apply({"op": "set", "id": "home.hero.title", "props": {"text": "Two"}}, note="two")
+        two = self.design_bytes()
+        self.undo(2)
+        self.assertEqual(self.design_bytes(), base)
+        code, out = self.redo()
+        self.assertEqual((code, out.strip()), (0, "ok  redid: one"))
+        self.assertEqual(self.design_bytes(), one)
+        self.redo()
+        self.assertEqual(self.design_bytes(), two)
+        self.assertEqual(self.redo()[0], 1)
+        self.undo()  # redo re-took a snapshot, so undo still works
+        self.assertEqual(self.design_bytes(), one)
+
+    def test_new_change_clears_redo(self):
+        self.apply({"op": "set", "id": "home.hero.title", "props": {"text": "One"}})
+        self.undo()
+        self.apply({"op": "set", "id": "home.hero.title", "props": {"text": "Other"}})
+        code, out = self.redo()
+        self.assertEqual((code, out.strip()), (1, "nothing to redo"))
+        self.assertEqual(self.title(), "Other")
+
+    # options ---------------------------------------------------------------
+
+    def test_options_flip_keep_and_undo(self):
+        base_title = self.title()
+        before = self.design_bytes()
+        command = "./ui apply --end-turn <<'OPS'\n" + json.dumps(self.options_envelope()) + "\nOPS"
+        code, out = self.apply_cli(self.options_envelope())
+        self.assertEqual(code, 0)
+        self.assertIn("skipped option 3 (Broken)", out)
+        self.assertEqual(self.title(), "Soft")
+        state = json.loads((self.live.dir / "variants.json").read_text(encoding="utf-8"))
+        self.assertEqual([v["name"] for v in state["variants"]], ["Soft", "Airy"])
+        # the end-turn hook replies with the options, not a summary
+        end = json.loads(self.hook({"hook_event_name": "PostToolUse", "tool_name": "Bash",
+                                    "tool_input": {"command": command}}))
+        self.assertIs(end["continue"], False)
+        self.assertIn("2 options (1 Soft · 2 Airy). Showing 1.", end["stopReason"])
+        self.assertIn("Option 2 of 2: Airy", self.say("next"))
+        self.assertEqual(self.title(), "Airy")
+        self.assertIn("Option 1 of 2: Soft", self.say("next"))  # wraps around
+        self.assertIn("Option 2 of 2", self.say("previous"))
+        self.assertIn("Option 1 of 2", self.say("option 1"))
+        self.assertEqual(self.say("option 4"), "There are only 2 options.")
+        self.assertEqual(self.title(), "Soft")
+        self.assertEqual(self.say("keep this one"), "✓ Kept option 1: Soft")
+        self.assertFalse((self.live.dir / "variants.json").exists())
+        self.assertIsNone(self.say("next"))  # options are done
+        self.assertEqual(self.title(), "Soft")
+        self.assertEqual(self.say("undo"), "↩ Undid: Make the greeting calmer [variant 1: Soft]")
+        self.assertEqual(self.title(), base_title)
+        self.assertEqual(self.design_bytes(), before, "one undo returns to the design before the options")
+
+    def test_flipping_options_takes_one_undo(self):
+        before = self.design_bytes()
+        self.apply_cli(self.options_envelope())
+        for _ in range(3):
+            self.say("next")
+        self.say("undo")  # while options are on screen, undo drops them all
+        self.assertEqual(self.design_bytes(), before)
+        self.assertFalse((self.live.dir / "variants.json").exists())
+
+    def test_options_all_invalid_writes_nothing(self):
+        before = self.design_bytes()
+        env = {"say": "Try", "options": [{"say": "Bad", "ops": [{"op": "remove", "id": "nope"}]}, "junk"]}
+        with self.assertRaises(ui.UIError) as cm:
+            self.apply_cli(env)
+        self.assertIn("no option is valid", str(cm.exception))
+        self.assertIn("option 2: must be", str(cm.exception))
+        self.assertEqual(self.design_bytes(), before)
+        self.assertFalse((self.live.dir / "variants.json").exists())
+
+    def test_options_are_each_applied_to_the_base(self):
+        env = {"say": "Two looks", "options": [
+            {"say": "Dark", "ops": [{"op": "path", "file": "app", "path": "colorScheme", "value": "dark"}]},
+            {"say": "Renamed", "ops": [{"op": "set", "id": "home.hero.title", "props": {"text": "Hey"}}]}]}
+        scheme = self.design().app.get("colorScheme")
+        self.apply_cli(env)
+        self.assertEqual(self.design().app.get("colorScheme"), "dark")
+        self.say("next")
+        self.assertEqual(self.design().app.get("colorScheme"), scheme, "option 2 must not carry option 1")
+        self.assertEqual(self.title(), "Hey")
+
+    # brief -----------------------------------------------------------------
+
+    def test_brief_in_context_and_appendable(self):
+        self.assertNotIn("designer's brief", ui.build_context(self.project))
+        self.apply({"op": "path", "file": "app", "path": "brief.-", "value": "Serif type everywhere"})
+        self.apply({"op": "path", "file": "app", "path": "brief.-", "value": "Calm, never alarming"})
+        self.assertEqual(self.design().app["brief"], ["Serif type everywhere", "Calm, never alarming"])
+        ctx = ui.build_context(self.project)
+        self.assertIn("# designer's brief", ctx)
+        self.assertIn("#   - Serif type everywhere\n#   - Calm, never alarming", ctx)
+        self.assertLess(ctx.index("designer's brief"), ctx.index("## screen"), "the brief heads the context")
+
+    def test_brief_validation(self):
+        for bad in ("Serif", ["ok", ""], ["x" * 301], [1]):
+            self.assertRejected({"op": "path", "file": "app", "path": "brief", "value": bad}, "brief")
+
+    # stats -----------------------------------------------------------------
+
+    def test_stats_counts_rounds(self):
+        for prompt, word in (("make it calmer", None), ("next", "next"), ("keep", "keep"),
+                             ("bigger title", None), ("undo", "undo")):
+            ui.log_prompt(self.project, prompt, word)
+        with captured() as (out, _):
+            self.assertEqual(ui.cmd_stats(self.project, argparse.Namespace()), 0)
+        line = out.getvalue()
+        self.assertIn("prompts 5 (to Claude 2, instant 3)", line)
+        self.assertIn("undo 1 (50% of changes)", line)
+        self.assertIn("options kept 1", line)
+
+
 class ClaudeCLIBackendTest(ProjectCase):
     def run_with(self, *results):
         calls = []

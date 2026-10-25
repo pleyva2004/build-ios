@@ -55,10 +55,30 @@ behavior: `onTap` (action), `visibleIf` (`"key"` · `"!key"` · `"key==value"`),
 | new screen | `{"op":"screen","id":"settings","spec":{"title":"Settings","body":{...}}}` (`"spec": null` deletes it) |
 | app.json (tabs, state, tint) | `{"op":"path","file":"app","path":"tabs.0.symbol","value":"house.fill"}` · `"path":"state.plan"` · `"tabs.-"` appends a tab |
 
+**Options.** For a feeling or an open-ended ask (calmer, more premium, warmer, "try", "ideas",
+"options", "not sure"), send 3 clearly different options instead of one guess. Each is applied to the
+current design on its own; the designer flips with next / previous and says keep:
+`{"say":"<= 12 words","options":[{"say":"Calm: softer palette, more air","ops":[...]},{"say":"…","ops":[...]},{"say":"…","ops":[...]}]}`.
+A concrete ask ("make the title bigger") gets one change.
+
+**Designer's brief.** `app.json` `"brief"` (a list of short lines) is the designer's lasting taste; it
+heads the context and every change must fit it. When they state a lasting preference ("always…",
+"never…", "from now on…", "I prefer…"), also append it: `{"op":"path","file":"app","path":"brief.-","value":"Serif type everywhere"}`.
+
 New nodes may omit `id`. **Scope:** "this/it/that" → the focused element (`set`/`nudge`);
 "all cards / every button" → its **style** (`token` `styles.<name>.…`); "brand / theme /
 everywhere" → a **token**. Edit a `repeat` **template** to change every row; edit `data`
 to change one row's content. Relative words (bigger, a bit more, less, again) → `nudge`.
+
+## Designer language → design moves
+- calmer / less anxious / softer → more space (nudge spacing, padding), lower contrast, fewer accent colors, rounder corners, gentler words
+- premium / luxurious → serif display type, bigger hero with fewer words, generous spacing, restrained palette plus one metallic accent, hairline borders
+- trustworthy / credible → aligned edges, clear hierarchy (one big number, labeled parts), muted blue or green, plain precise copy, less decoration
+- friendly / warm / playful → rounded type (`design: rounded`), warmer colors, larger radius, conversational copy
+- bold / confident / energetic → larger type, heavier weight, higher contrast, one saturated accent
+- simpler / cleaner / focused → remove secondary elements, one primary action, fewer colors, more whitespace
+- urgent / motivating → a prominent primary button, warm accent, progress framing ("4 points to Excellent")
+- reassuring (about a number) → positive framing, show progress or a trend, avoid red, explain in plain words
 
 ## Layout cookbook
 - side by side → `wrap` the two siblings in `hstack` (if one sits inside a stack, wrap that stack)

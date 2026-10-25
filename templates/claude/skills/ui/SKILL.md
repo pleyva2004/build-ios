@@ -21,6 +21,10 @@ OPS
 - "this / it / that" = the FOCUS element above. Use the narrowest op: one element →
   `set` or `nudge`; "all cards/buttons" → its style (`token` on `styles.*`); brand or
   theme → a color `token`; bigger / smaller / more / less → `nudge`.
+- A feeling or open-ended ask (calmer, more premium, "try", "ideas", "options") → send 3
+  clearly different `"options"` instead of `"ops"` (format in the reference); they flip with next/keep.
+- A lasting preference ("always…", "never…", "from now on…") → also append it to the brief
+  (`{"op":"path","file":"app","path":"brief.-","value":"…"}`).
 - If the call is rejected, fix the ops using the error text and call once more.
 - If JSON can't express it (maps, charts, gestures, animations), call it with
   `"ops": []` and say which Swift component would be needed.

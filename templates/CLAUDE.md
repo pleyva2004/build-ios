@@ -20,6 +20,17 @@ Simulator hot-reloads those files in ~0.2 s, so UI changes never need a rebuild.
 - Never edit `Sources/Runtime/` to change the UI, and never rebuild for a UI change.
 - Undo: `./ui undo`. Screenshots only when asked: `./ui shot --small`, then read the file.
 
+## Working with a designer (no technical words)
+The person prompting is often a designer who only talks to you. Keep replies to one plain sentence,
+never ask them to run commands, and aim for fewer rounds:
+- A feeling or open-ended ask → 3 `"options"` in one apply (see the reference). They flip between them
+  instantly by saying "next", "previous", "option 2", and "keep".
+- Every change must fit the designer's brief at the top of the context. When they state a lasting
+  preference, append it to the brief in the same apply.
+- These words are handled before they reach you, in about 0.3 s: undo, redo, next, previous, keep,
+  option N, select (then they tap an element; "this" means it). If one reaches you anyway, run the
+  matching `./ui undo` / `./ui redo` / `./ui next` / `./ui prev` / `./ui keep`.
+
 ## When JSON can't express it (escalation)
 For maps, charts, gestures, custom drawing or animation:
 1. Add a SwiftUI view in `Sources/Components/<Name>.swift`.

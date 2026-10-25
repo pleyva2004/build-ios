@@ -11,7 +11,7 @@ those changes fast and safe for people and for small, fast models:
 
   ./ui context              compact map of the current screen (what a model reads)
   ./ui apply '<ops>'        validate + apply id-addressed edits, wait for the render
-  ./ui undo                 revert the last apply
+  ./ui undo | redo          revert the last apply / re-apply it
   ./ui pick                 tap an element in the Simulator -> prints its id
   ./ui ask "<request>"      one model call -> ops -> applied   (-n 3 for variants)
   ./ui next | prev | keep   cycle / keep variants from `ask -n`
@@ -33,8 +33,10 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import copy
 import difflib
+import io
 import json
 import os
 import re
@@ -640,6 +642,10 @@ class Validator:
             self.err("app.json", "colorScheme must be light, dark or system")
         if "state" in app and not isinstance(app["state"], dict):
             self.err("app.json", "\"state\" must be an object")
+        brief = app.get("brief")
+        if brief is not None and (not isinstance(brief, list)
+                                  or not all(isinstance(b, str) and 0 < len(b) <= 300 for b in brief)):
+            self.err("app.json", "\"brief\" must be a list of short strings (one preference each)")
 
     def check_screen(self, sid: str, screen: dict) -> None:
         where = f"screens/{sid}.json"
@@ -1716,6 +1722,32 @@ class Live:
         for old in existing[:-99]:
             shutil.rmtree(hist / str(old), ignore_errors=True)
 
+    def push_redo(self, texts: dict, label: str) -> None:
+        root = self.dir / "redo"
+        root.mkdir(parents=True, exist_ok=True)
+        existing = sorted(int(p.name) for p in root.iterdir() if p.name.isdigit())
+        target = root / str((existing[-1] + 1) if existing else 1)
+        for name, text in texts.items():
+            write_atomic(target / name, text)
+        write_atomic(target / ".label", label)
+
+    def pop_redo(self):
+        """(texts, label) of the most recently undone change, removed from the redo stack."""
+        root = self.dir / "redo"
+        if not root.exists():
+            return None
+        existing = sorted(int(p.name) for p in root.iterdir() if p.name.isdigit())
+        if not existing:
+            return None
+        snap = root / str(existing[-1])
+        texts = {str(p.relative_to(snap)): p.read_text(encoding="utf-8") for p in snap.rglob("*.json")}
+        label = (snap / ".label").read_text(encoding="utf-8") if (snap / ".label").exists() else ""
+        shutil.rmtree(snap, ignore_errors=True)
+        return texts, label
+
+    def clear_redo(self) -> None:
+        shutil.rmtree(self.dir / "redo", ignore_errors=True)
+
     def latest_snapshot(self):
         hist = self.dir / "history"
         if not hist.is_dir():
@@ -1841,6 +1873,7 @@ def _run_ops_locked(project, ops, note, wait, shot, quiet, record, start_texts, 
     if pending["write"] or pending["remove"]:
         if snapshot:
             live.snapshot(before, note or ", ".join(applier.summary)[:200])
+            live.clear_redo()  # a new change ends the redo chain
         files = write_design(project, design)
     rev = live.bump_rev(applier.changed, quiet=shot)
     write_ms = (time.time() - t0) * 1000
@@ -2024,6 +2057,10 @@ def build_context(project: Project, screen: str = None, request: str = "") -> st
     elif d.app.get("root"):
         nav = f"root: {d.app.get('root')}"
     L.append(f"# app {d.app.get('name', '')}  ({nav})")
+    brief = [b for b in (d.app.get("brief") or []) if isinstance(b, str)] if isinstance(d.app.get("brief"), list) else []
+    if brief:
+        L.append("# designer's brief (their taste and lasting preferences; every change must fit it):")
+        L.extend(f"#   - {b[:200]}" for b in brief[-30:])
     if alive:
         stack = " › ".join(status.get("stack") or [])
         L.append(f"# simulator: showing '{status.get('screen')}'  stack: {stack}")
@@ -2551,6 +2588,8 @@ def cmd_apply(project: Project, args) -> int:
             env = json.loads(raw)
             if isinstance(env, dict) and isinstance(env.get("say"), str):
                 note = env["say"]
+                if isinstance(env.get("options"), list):
+                    return apply_options(project, env, args, end_turn)
                 if env.get("ops") == [] and end_turn:
                     # Claude Code ignores `continue: false` from PostToolUseFailure hooks,
                     # so an escalation that should end the turn succeeds (exit 0) and the
@@ -2571,6 +2610,43 @@ def cmd_apply(project: Project, args) -> int:
     return 0
 
 
+def apply_options(project: Project, env: dict, args, end_turn: bool) -> int:
+    """{"say", "options": [{"say", "ops"}, ...]}: each option is checked against the current
+    design; the first is shown and the rest wait for next / previous / keep."""
+    base = Design(project).snapshot_texts()
+    valid, problems = [], []
+    for i, opt in enumerate(env["options"][:4]):
+        if not isinstance(opt, dict):
+            problems.append(f"option {i + 1}: must be {{\"say\", \"ops\"}}")
+            continue
+        name = str(opt.get("say") or f"Option {i + 1}")[:80]
+        try:
+            ops = parse_ops(opt.get("ops", []))
+            if not ops:
+                raise UIError("no ops")
+            dry_run(project, ops, base=base)
+        except UIError as e:
+            problems.append(f"option {i + 1} ({name}): {e}")
+            continue
+        valid.append({"name": name, "ops": ops})
+    if not valid:
+        raise UIError("rejected, no option is valid (nothing was written):\n  " + "\n  ".join(problems))
+    for p in problems:
+        print(f"    skipped {p}")
+    live = Live(project)
+    request = str(env.get("say") or "options")
+    write_atomic(live.dir / "variants.json", dump({"request": request, "base": base, "variants": valid, "current": -1}))
+    show_variant(project, 0, shot=args.shot)
+    names = " · ".join(f"{i + 1} {v['name']}" for i, v in enumerate(valid))
+    display = (f"{len(valid)} options ({names}). Showing 1. Say “next”, “previous”, “option 2” or “keep”."
+               if len(valid) > 1 else f"{valid[0]['name']}")
+    info = live.read("last-apply.json") or {}
+    info.update({"at": time.time(), "say": request, "display": display})
+    write_atomic(live.dir / "last-apply.json", compact(info))
+    print(f"    {display}")
+    return 0
+
+
 def cmd_undo(project: Project, args) -> int:
     live = Live(project)
     for _ in range(max(1, args.steps)):
@@ -2582,6 +2658,7 @@ def cmd_undo(project: Project, args) -> int:
         for p in snap.rglob("*.json"):
             texts[str(p.relative_to(snap))] = p.read_text(encoding="utf-8")
         label = (snap / ".label").read_text(encoding="utf-8") if (snap / ".label").exists() else ""
+        live.push_redo(Design(project).raw_texts(), label)
         restore_texts(project, texts)
         shutil.rmtree(snap, ignore_errors=True)
         print(f"ok  undid: {label}")
@@ -2589,6 +2666,22 @@ def cmd_undo(project: Project, args) -> int:
         (live.dir / "variants.json").unlink()
     except FileNotFoundError:
         pass
+    rev = live.bump_rev([])
+    live.wait_rev(rev, 1.5)
+    return 0
+
+
+def cmd_redo(project: Project, args) -> int:
+    live = Live(project)
+    for _ in range(max(1, getattr(args, "steps", 1))):
+        got = live.pop_redo()
+        if got is None:
+            print("nothing to redo")
+            return 1
+        texts, label = got
+        live.snapshot(Design(project).raw_texts(), label)  # so undo works again
+        restore_texts(project, texts)
+        print(f"ok  redid: {label}")
     rev = live.bump_rev([])
     live.wait_rev(rev, 1.5)
     return 0
@@ -2656,11 +2749,11 @@ def cmd_shot(project: Project, args) -> int:
 
 def cmd_stats(project: Project, args) -> int:
     path = project.live / "timings.jsonl"
-    if not path.exists():
+    if not path.exists() and not (project.live / "prompts.jsonl").exists():
         print("no timings yet")
         return 1
     rows = []
-    for line in path.read_text(encoding="utf-8").splitlines()[-500:]:
+    for line in (path.read_text(encoding="utf-8").splitlines()[-500:] if path.exists() else []):
         try:
             rows.append(json.loads(line))
         except json.JSONDecodeError:
@@ -2683,6 +2776,20 @@ def cmd_stats(project: Project, args) -> int:
         if cached:
             parts.append(f"cache hits {sum(1 for c in cached if c)}/{len(cached)}")
         print("  ".join(parts))
+    prompts = []
+    try:
+        for line in (project.live / "prompts.jsonl").read_text(encoding="utf-8").splitlines()[-2000:]:
+            prompts.append(json.loads(line))
+    except (OSError, json.JSONDecodeError):
+        pass
+    if prompts:
+        words = [p.get("instant") or "" for p in prompts]
+        model = sum(1 for w in words if not w)
+        undos = words.count("undo")
+        kept = words.count("keep")
+        print(f"rounds    prompts {len(prompts)} (to Claude {model}, instant {len(prompts) - model})  "
+              f"undo {undos} ({undos / max(model, 1):.0%} of changes)  redo {words.count('redo')}  "
+              f"options kept {kept}  select {words.count('select')}")
     return 0
 
 
@@ -2813,7 +2920,7 @@ def cmd_validate(project: Project, args) -> int:
     return 0
 
 
-HEREDOC_FIRST = re.compile(r"^\./ui (apply|context|undo|status|shot|pick|validate|stats|reference|next|prev|keep)"
+HEREDOC_FIRST = re.compile(r"^\./ui (apply|context|undo|redo|status|shot|pick|validate|stats|reference|next|prev|keep)"
                            r"((?: [A-Za-z0-9_.@/=-]+)*)(?: <<'([A-Z]{2,10})')?$")
 
 
@@ -2836,6 +2943,95 @@ def inert_ui_command(cmd: str) -> bool:
     return all(line != delim for line in lines[1:-1])
 
 
+INSTANT_WORDS = {
+    "undo": {"undo", "undo that", "undo it", "undo last", "undo the last change", "undo last change", "go back",
+             "revert", "revert that", "revert it", "back", "take that back", "change it back"},
+    "redo": {"redo", "redo that", "redo it", "put it back", "bring it back"},
+    "next": {"next", "next one", "next option", "show next", "show the next one", "show me the next one",
+             "another", "another one"},
+    "prev": {"previous", "prev", "previous one", "previous option", "go back one", "the one before",
+             "show previous", "show the previous one"},
+    "keep": {"keep", "keep it", "keep that", "keep this", "keep this one", "keep that one", "this one",
+             "that one", "use this", "use this one", "use that one", "go with this", "go with this one",
+             "go with that one", "i like this one", "i like that one", "lets go with this", "let's go with this"},
+    "select": {"select", "pick", "point", "let me pick", "let me select", "let me point", "select something",
+               "pick something", "select an element", "pick an element"},
+}
+VARIANT_WORDS = {"next", "prev", "keep"}
+
+
+def instant_word(project: Project, prompt: str):
+    """Short designer words that don't need a model: undo, redo, next, previous, keep,
+    option N, select. next/previous/keep/option N only while options are on screen."""
+    text = prompt.strip().lower()
+    if text.startswith("/ui"):
+        text = text[3:]
+    text = re.sub(r"^(please|ok|okay|hmm|ah|oh)[,!. ]+", "", text.strip())
+    text = re.sub(r"[\s.!?,]+$", "", text).replace("’", "'")
+    text = re.sub(r"\s+", " ", text)
+    if not text or len(text) > 40:
+        return None
+    options_on = (project.live / "variants.json").exists()
+    m = re.fullmatch(r"(?:option|number|show|try|show me)?\s*#?([1-4])", text)
+    if m and options_on:
+        return f"option:{int(m.group(1))}"
+    for word, phrases in INSTANT_WORDS.items():
+        if text in phrases:
+            if word in VARIANT_WORDS and not options_on:
+                return None
+            if word == "undo" and options_on and text in ("back", "go back"):
+                return "prev"
+            return word
+    return None
+
+
+def run_instant(project: Project, word: str):
+    live = Live(project)
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            if word == "undo":
+                code = cmd_undo(project, argparse.Namespace(steps=1))
+                text = out.getvalue().strip()
+                return ("↩ " + text.replace("ok  undid: ", "Undid: ")) if code == 0 else "Nothing to undo."
+            if word == "redo":
+                code = cmd_redo(project, argparse.Namespace(steps=1))
+                text = out.getvalue().strip()
+                return ("↪ " + text.replace("ok  redid: ", "Redid: ")) if code == 0 else "Nothing to redo."
+            if word == "select":
+                if not live.app_alive():
+                    return None
+                write_atomic(live.dir / "pick", str(time.time()))
+                return "Tap the element in the Simulator, then tell me what to change about it."
+            state = live.read("variants.json")
+            if not state:
+                return None
+            n, cur = len(state["variants"]), state.get("current", 0)
+            if word == "keep":
+                cmd_keep(project, argparse.Namespace())
+                return f"✓ Kept option {cur + 1}: {state['variants'][cur]['name']}"
+            index = (cur + 1) if word == "next" else (cur - 1) if word == "prev" else int(word.split(":")[1]) - 1
+            if word.startswith("option:") and not 0 <= index < n:
+                return f"There are only {n} options."
+            show_variant(project, index)
+            index %= n
+            return f"Option {index + 1} of {n}: {state['variants'][index]['name']} — say “next”, “previous” or “keep”."
+    except UIError as e:
+        return f"Couldn't do that: {e}"
+
+
+def log_prompt(project: Project, prompt: str, word) -> None:
+    """One line per designer prompt, for `./ui stats` (rounds, undos, options kept)."""
+    try:
+        line = compact({"at": round(time.time(), 2), "prompt": prompt[:160], "instant": word,
+                        "options_on": (project.live / "variants.json").exists()})
+        project.live.mkdir(parents=True, exist_ok=True)
+        with (project.live / "prompts.jsonl").open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
 def cmd_hook(project: Project, args) -> int:
     """One entry point for Claude Code hooks (fast, never blocks on errors):
     UserPromptSubmit -> adds the live UI context; PreToolUse(Bash) -> allows inert
@@ -2851,6 +3047,14 @@ def cmd_hook(project: Project, args) -> int:
     ti = payload.get("tool_input") or {}
     if event == "UserPromptSubmit":
         prompt = str(payload.get("prompt", "")).lstrip()
+        word = instant_word(project, prompt)
+        log_prompt(project, prompt, word)
+        if word and not os.environ.get("UI_NO_INSTANT"):
+            message = run_instant(project, word)
+            if message:
+                # Handled without a model turn: stop here and show the result.
+                print(compact({"continue": False, "stopReason": message}))
+                return 0
         # The hook owns context for plain prompts and /ui (cwd-independent, includes
         # text->id mentions); other slash commands get nothing.
         if os.environ.get("UI_NO_CONTEXT_HOOK") or (prompt.startswith("/") and not re.match(r"/ui\b", prompt)):
@@ -2887,7 +3091,7 @@ def cmd_hook(project: Project, args) -> int:
             where = {"live": f"live on '{info.get('screen')}' in {info.get('seconds')}s",
                      "down": "saved — app not running (./run.sh)",
                      "unconfirmed": "saved — app didn't confirm"}.get(info.get("app"), "")
-            msg = f"✓ {info.get('say') or '; '.join(info.get('summary') or [])} · {where}"
+            msg = f"✓ {info.get('display') or info.get('say') or '; '.join(info.get('summary') or [])} · {where}"
             if info.get("error"):
                 msg += f" · app error: {info['error']}"
             print(compact({"continue": False, "stopReason": msg}))
@@ -3235,6 +3439,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("reference", help="print the ops / node reference")
     sub.add_parser("hook", help="Claude Code hook entry point (reads hook JSON on stdin)")
 
+    s = sub.add_parser("redo", help="re-apply the last undone change")
+    s.add_argument("steps", nargs="?", type=int, default=1)
+
     s = sub.add_parser("eject", help="write a standalone SwiftUI app from design/ (plain code, no JSON runtime)")
     s.add_argument("--out", help="output folder (default: ../<Name>SwiftUI next to this project)")
     s.add_argument("--force", action="store_true", help="overwrite files changed since the last eject")
@@ -3278,7 +3485,7 @@ def main(argv=None) -> int:
         "context": cmd_context, "apply": cmd_apply, "undo": cmd_undo, "pick": cmd_pick, "status": cmd_status,
         "shot": cmd_shot, "validate": cmd_validate, "reference": cmd_reference, "ask": cmd_ask, "chat": cmd_chat,
         "keep": cmd_keep, "stats": cmd_stats, "tune": cmd_tune, "hook": cmd_hook, "eval": cmd_eval,
-        "eject": cmd_eject,
+        "eject": cmd_eject, "redo": cmd_redo,
         "next": lambda pr, a: cmd_variant_step(pr, a, 1),
         "prev": lambda pr, a: cmd_variant_step(pr, a, -1),
     }

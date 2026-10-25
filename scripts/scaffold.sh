@@ -44,6 +44,7 @@ chmod +x "$DEST/run.sh" "$DEST/ui"
 
 # Claude Code: instructions, the /ui fast-path skill, hooks + permissions
 subst "$TPL/CLAUDE.md" > "$DEST/CLAUDE.md"
+cp "$TPL/DESIGNER.md" "$DEST/DESIGNER.md"
 cp "$TPL/claude/skills/ui/SKILL.md" "$DEST/.claude/skills/ui/SKILL.md"
 cp "$TPL/claude/settings.json" "$DEST/.claude/settings.json"
 cp "$TPL/gitignore" "$DEST/.gitignore"
