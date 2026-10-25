@@ -34,6 +34,7 @@ cd ~/Code/MyApp && ./run.sh                      # build + launch once
 ./ui ask -n 3 "make the home screen feel premium" && ./ui next
 ./ui pick && ./ui tune                           # tap an element, nudge it with keys
 ./ui undo
+./ui eval                                        # model accuracy + latency on 24 sample requests
 claude --model haiku                             # then: /ui add a settings screen
 ```
 

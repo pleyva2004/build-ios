@@ -125,9 +125,10 @@ The app reports its component catalog to the tooling, so models can use register
 ## Verification
 - `tests/test_ui.py` covers every op, the auto-fixes, validation, undo, the live handshake, hooks, `ask` with a fake model, and a drift test between the Swift renderer, the validator and `REFERENCE.md`.
 - `.github/workflows/ios.yml` compiles a scaffolded app on a macOS runner and runs a Simulator smoke test: launch → live link → `./ui apply` → confirmed revision → undo, with before/after screenshots.
+- `./ui eval` measures the model itself. `tools/evals.jsonl` holds 24 natural-language requests: scope, layout, repeat template vs. row data, toolbar insert, follow-ups and must-escalate cases. Each is checked by assertions on the resulting design, and the report gives pass rate, valid-first-try rate and p50/p90 latency per model. It needs an API key and hasn't been run yet.
 
 ## Not done yet / ideas
 - **Physical iPhone hot reload:** serve `design/` over the LAN (needs ATS `NSAllowsLocalNetworking` / IP exceptions and the Local Network permission). Today a device runs the bundled copy.
 - **Swift-level hot reload** (InjectionNext) for custom components, instead of a rebuild.
-- **An LLM eval set** (requests → spec assertions) to tune the prompt, plus logging undos as failure labels.
+- **Log quick undos** as failure labels and grow the eval set from them.
 - **"Eject"** a settled design to handwritten SwiftUI, if a prototype graduates to a real app.

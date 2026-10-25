@@ -41,7 +41,7 @@ ops reference (`tools/REFERENCE.md`).
 - **In Claude Code**: `/ui <change>` (a project skill in every scaffolded app). It runs one Haiku turn with the live context already injected, makes one `./ui apply --end-turn`, and a hook ends the turn. For long sessions, start `claude --model haiku` in the app folder.
 - **In a terminal**: `./ui ask "<change>"` is one direct Claude API call (needs `ANTHROPIC_API_KEY` + `uv`). `./ui ask -n 3 "<idea>"` builds 3 variants in parallel; switch with `./ui next` / `prev` / `keep`. `./ui chat` keeps the client warm.
 - **No model at all**: `./ui pick` (tap an element in the Simulator → its id), then `./ui tune` (single keys nudge size/padding/spacing/radius/weight, cycle colors and styles).
-- **Measure**: `./ui stats` prints p50/p90 for model time, write time and render confirmation.
+- **Measure**: `./ui stats` prints p50/p90 for model time, write time and render confirmation. `./ui eval` runs `tools/evals.jsonl`, 24 requests with assertions on the resulting design, and reports pass rate, valid-first-try rate and latency. It makes one model call per case.
 
 ## Key facts & gotchas
 - **Hot reload needs the project folder readable by the Simulator.** Keep projects out of `~/Documents`, `~/Desktop`, `~/Downloads` and iCloud Drive, which macOS privacy protection may block. `./ui status` shows `source` (env/defaults/source = live; `bundle` = not live).

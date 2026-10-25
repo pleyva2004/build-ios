@@ -18,6 +18,7 @@ those changes fast and safe for people and for small, fast models:
   ./ui tune [id]            no-model fast lane: single keys nudge size/padding/color…
   ./ui chat                 interactive loop (fastest: keeps the model client warm)
   ./ui status | shot | stats | validate | reference
+  ./ui eval                 accuracy + latency of the model on tools/evals.jsonl
   ./ui hook                 Claude Code hook entry point (see .claude/settings.json)
 
 Exit codes: 0 ok · 1 error · 2 validation failed (hook) · 3 ESCALATE (needs Swift)
@@ -121,14 +122,18 @@ class Design:
 
     def load(self) -> None:
         d = self.project.design
+        self._raw = {}
         self.app = self._read(d / "app.json", "app.json", required=True)
         self.tokens = self._read(d / "tokens.json", "tokens.json", required=False)
         self.screens = {}
         sdir = d / "screens"
         if sdir.is_dir():
             for p in sorted(sdir.glob("*.json")):
+                if p.name.startswith("."):
+                    continue
+                errors_before = len(self.load_errors)
                 data = self._read(p, f"screens/{p.name}", required=True)
-                if isinstance(data, dict):
+                if isinstance(data, dict) and len(self.load_errors) == errors_before:
                     self.screens[p.stem] = data
         self._original = self.snapshot_texts()
 
@@ -147,7 +152,9 @@ class Design:
                 self.load_errors.append(f"{label}: missing")
             return {}
         try:
-            data = read_json(path)
+            text = path.read_text(encoding="utf-8")
+            data = json.loads(text)
+            self._raw[label] = text
         except json.JSONDecodeError as e:
             self.load_errors.append(f"{label}: invalid JSON (line {e.lineno}, col {e.colno}): {e.msg}")
             return {}
@@ -166,6 +173,10 @@ class Design:
 
     def snapshot_texts(self) -> dict:
         return {name: dump(obj) for name, obj in self.file_map().items()}
+
+    def raw_texts(self) -> dict:
+        """The files as loaded, byte for byte (undo snapshots), before any op ran."""
+        return {name: self._raw.get(name, dump(obj)) for name, obj in self.file_map().items()}
 
     def changed_files(self) -> dict:
         now = self.snapshot_texts()
@@ -449,7 +460,8 @@ class Fixer:
                 t = fixed
         allowed = COMMON_PROPS | TYPE_PROPS.get(t, set()) | STRUCTURAL
         for k in list(node.keys()):
-            if k in allowed or k.startswith("_") or t == "custom":
+            # onTap is a common prop, but a button only runs "action" (Swift ignores its onTap)
+            if (k in allowed and not (k == "onTap" and t == "button")) or k.startswith("_") or t == "custom":
                 continue
             target = PROP_ALIASES.get(k)
             if k == "color" and t == "shape":
@@ -460,7 +472,7 @@ class Fixer:
                 target = "header"
             if k == "action" and t != "button":
                 target = "onTap"
-            if k == "onTap" and t == "button":
+            if (k == "onTap" or target == "onTap") and t == "button":
                 target = "action"
             if target and target not in node and (target in allowed):
                 node[target] = node.pop(k)
@@ -490,13 +502,14 @@ class Fixer:
                     new = CSS_COLORS[v.lower()]
             elif k in ALIGN_PROPS:
                 new = DIRECTION_FIX.get(v, v)
-            elif k in NUMBER_PROPS or k in ("radius", "padding"):
+            elif k in NUMBER_PROPS or k in INT_PROPS or k in ("radius", "padding"):
                 if v in spaces:
                     new = "$" + v
                 else:
                     try:
                         num = float(v)
-                        new = int(num) if num.is_integer() else num
+                        if abs(num) < float("inf"):  # "infinity" stays a string; NaN is skipped
+                            new = int(num) if num.is_integer() else num
                     except ValueError:
                         pass
             elif k in ENUMS and v not in ENUMS[k]:
@@ -1034,7 +1047,7 @@ def set_path(root, path: str, value, label: str):
             if part not in cur or not isinstance(cur[part], (dict, list)):
                 if value is None:
                     return
-                cur[part] = [] if nxt.isdigit() else {}
+                cur[part] = [] if nxt.isdigit() or nxt in ("-", "append") else {}
             cur = cur[part]
         elif isinstance(cur, list):
             if not part.isdigit() or int(part) >= len(cur):
@@ -1183,6 +1196,21 @@ class Applier:
         self.fixer.normalize_props(tmp, nid)  # fixes aliases like cornerRadius -> radius
         if not user_set_type:
             tmp.pop("type", None)
+        new_type = tmp.get("type")
+        if user_set_type and new_type in NODE_TYPES and new_type not in (node.get("type"), "custom"):
+            # A type change keeps what the new type understands: align is mapped across
+            # axes (vstack leading <-> hstack top), other props it lacks are dropped.
+            allowed = COMMON_PROPS | TYPE_PROPS[new_type] | STRUCTURAL
+            aligns = ALIGN_BY_TYPE["vstack"] | ALIGN_BY_TYPE["hstack"] if new_type == "scroll" \
+                else ALIGN_BY_TYPE.get(new_type, ALIGN_9)
+            for k in list(node):
+                if k in tmp or k.startswith("_"):
+                    continue
+                if k not in allowed:
+                    tmp[k] = None
+                elif k == "align" and node[k] not in aligns:
+                    swapped = {"leading": "top", "trailing": "bottom", "top": "leading", "bottom": "trailing"}.get(node[k])
+                    tmp[k] = swapped if swapped in aligns else None
         for k, v in tmp.items():
             if k == "id":
                 if v != nid and v in self.d.index():
@@ -1308,6 +1336,8 @@ class Applier:
         if not isinstance(sid, str) or not ID_RE.match(sid):
             raise UIError("needs a screen \"id\" (letters, digits, -, _)")
         if spec is None:
+            if "spec" not in op:  # a forgotten "spec" must not delete a whole screen
+                raise UIError("needs \"spec\": {\"title\":..., \"body\":{...}} (\"spec\": null deletes the screen)")
             if sid in self.d.screens:
                 del self.d.screens[sid]
                 self.summary.append(f"delete screen {sid}")
@@ -1387,6 +1417,8 @@ class Applier:
             root = self.d.screens[sid]
         else:
             raise UIError("needs \"file\": \"app\" | \"tokens\" | \"screens/<id>\"")
+        if not isinstance(path, str) or not path:
+            raise UIError("needs \"path\" inside the file, e.g. \"tabs.0.title\"")
         set_path(root, path, op.get("value"), "path")
         self.mark(f"{f}:{path}")
         self.summary.append(f"path {f}:{path} = {compact(op.get('value'))[:60]}")
@@ -1407,6 +1439,9 @@ def nudge_value(design: Design, node: dict, prop: str, by: int):
     styles = tokens.get("styles") if isinstance(tokens.get("styles"), dict) else {}
     style = styles.get(str(node.get("style", "")).lstrip("$"), {}) if node.get("style") else {}
     cur = node.get(prop, style.get(prop) if isinstance(style, dict) else None)
+    font = node.get("font", style.get("font") if isinstance(style, dict) else None)
+    if isinstance(font, str) and font.startswith("$"):
+        font = (tokens.get("fonts") or {}).get(font[1:])
     if prop == "size" and node.get("type") == "button":
         ladder = ["mini", "small", "regular", "large", "extraLarge"]
         c = node.get("controlSize") if node.get("controlSize") in ladder else "regular"
@@ -1423,9 +1458,6 @@ def nudge_value(design: Design, node: dict, prop: str, by: int):
     if prop == "size":
         size = cur if isinstance(cur, (int, float)) and not isinstance(cur, bool) else None
         if size is None:
-            font = node.get("font", style.get("font") if isinstance(style, dict) else None)
-            if isinstance(font, str) and font.startswith("$"):
-                font = (tokens.get("fonts") or {}).get(font[1:])
             if isinstance(font, dict) and isinstance(font.get("size"), (int, float)):
                 size = font["size"]
             elif isinstance(font, str):
@@ -1451,6 +1483,8 @@ def nudge_value(design: Design, node: dict, prop: str, by: int):
         target = step_scale(scale, float(value), by)
         return "$" + dict((v, k) for v, k in named)[target]
     if prop == "weight":
+        if cur not in WEIGHT_ORDER:  # start from the font's weight, so "bolder" never lightens
+            cur = font.get("weight") if isinstance(font, dict) else ("semibold" if font == "headline" else None)
         w = cur if cur in WEIGHT_ORDER else "regular"
         i = max(0, min(len(WEIGHT_ORDER) - 1, WEIGHT_ORDER.index(w) + by))
         return WEIGHT_ORDER[i]
@@ -1654,7 +1688,7 @@ def _run_ops_locked(project, ops, note, wait, shot, quiet, record, start_texts, 
     design = Design(project)
     if design.load_errors:
         raise UIError("design files are broken, fix them first:\n  " + "\n  ".join(design.load_errors))
-    before = design.snapshot_texts()
+    before = design.raw_texts()
     if start_texts is not None:
         design.load_texts(start_texts)
     applier = Applier(design)
@@ -2604,8 +2638,9 @@ def cmd_hook(project: Project, args) -> int:
     tool = payload.get("tool_name")
     ti = payload.get("tool_input") or {}
     if event == "UserPromptSubmit":
-        if os.environ.get("UI_NO_CONTEXT_HOOK"):
-            return 0
+        prompt = str(payload.get("prompt", "")).lstrip()
+        if os.environ.get("UI_NO_CONTEXT_HOOK") or prompt.startswith("/"):
+            return 0  # slash commands (e.g. /ui) inject their own context
         try:
             ctx = build_context(project, request=str(payload.get("prompt", ""))[:500])
         except Exception:
@@ -2722,6 +2757,146 @@ def cmd_chat(project: Project, args) -> int:
             print(f"error {e}")
 
 
+# --------------------------------------------------------------------------
+# Eval: does the small model change the right thing on the first try?
+# --------------------------------------------------------------------------
+
+
+def _node_by_id(design: Design, nid: str):
+    loc = design.index().get(nid)
+    return loc
+
+
+def _check(design: Design, base: Design, exp: dict, escalated: bool) -> str:
+    """Returns "" when the expectation holds, else a short reason."""
+    if "escalate" in exp:
+        return "" if escalated == bool(exp["escalate"]) else f"escalate={escalated}"
+    if escalated:
+        return "escalated"
+    if "token" in exp:
+        now, was = resolve_path(design.tokens, exp["token"]), resolve_path(base.tokens, exp["token"])
+        if "changed" in exp:
+            return "" if (now != was) == exp["changed"] else f"token {exp['token']} changed={now != was}"
+        return "" if now == exp.get("eq") else f"token {exp['token']}={compact(now)}"
+    if "data" in exp:
+        sid, path = exp["data"].split(":", 1)
+        val = resolve_path(design.screens.get(sid, {}).get("data", {}), path)
+        return "" if val == exp.get("eq") else f"data {exp['data']}={compact(val)}"
+    if "app" in exp:
+        val = resolve_path(design.app, exp["app"])
+        return "" if val == exp.get("eq") else f"app {exp['app']}={compact(val)}"
+    if "screen_exists" in exp:
+        return "" if exp["screen_exists"] in design.screens else f"no screen {exp['screen_exists']}"
+    if "toolbar_count" in exp:
+        n = len(design.screens.get(exp["toolbar_count"], {}).get("toolbar") or [])
+        return "" if n >= exp.get("gte", 1) else f"toolbar has {n}"
+    if "text_exists" in exp:
+        for loc in design.walk():
+            if loc.screen == exp.get("screen", loc.screen) and exp["text_exists"] in str(loc.node.get("text", "")):
+                return ""
+        return f"no text {exp['text_exists']!r}"
+    if "text_exists_any_type" in exp:
+        for loc in design.walk():
+            if loc.screen == exp.get("screen", loc.screen) and loc.node.get("type") == exp["text_exists_any_type"] \
+                    and loc.node.get("axis") == "horizontal":
+                return ""
+        return f"no horizontal {exp['text_exists_any_type']}"
+    nid = exp.get("id")
+    loc = _node_by_id(design, nid) if nid else None
+    if "exists" in exp:
+        return "" if (loc is not None) == exp["exists"] else f"{nid} exists={loc is not None}"
+    if loc is None:
+        return f"{nid} missing"
+    node = loc.node
+    if exp.get("unchanged"):
+        old = _node_by_id(base, nid)
+        return "" if old is not None and old.node == node else f"{nid} changed"
+    if "parent_type" in exp:
+        ptype = loc.parent.get("type") if loc.parent else None
+        return "" if ptype == exp["parent_type"] else f"{nid} parent is {ptype}"
+    if exp.get("hidden"):
+        if node.get("visibleIf") or node.get("opacity") == 0:
+            return ""
+        return f"{nid} still visible"
+    prop = exp.get("prop")
+    val = node.get(prop)
+    if "eq" in exp:
+        return "" if val == exp["eq"] else f"{nid}.{prop}={compact(val)}"
+    if "in" in exp:
+        return "" if val in exp["in"] else f"{nid}.{prop}={compact(val)}"
+    if "gt" in exp:
+        return "" if isinstance(val, (int, float)) and val > exp["gt"] else f"{nid}.{prop}={compact(val)}"
+    if "changed" in exp:
+        old = _node_by_id(base, nid)
+        was = old.node.get(prop) if old else None
+        return "" if (val != was) == exp["changed"] else f"{nid}.{prop} unchanged ({compact(val)})"
+    return "unknown expectation"
+
+
+def cmd_eval(project: Project, args) -> int:
+    """Runs tools/evals.jsonl against throwaway copies of design/ and reports
+    first-try validity, pass rate and latency. Costs one model call per case."""
+    import tempfile
+
+    cases_path = Path(args.file) if args.file else project.root / "tools" / "evals.jsonl"
+    cases = [json.loads(l) for l in cases_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    if args.only:
+        cases = [c for c in cases if args.only.lower() in c.get("name", "").lower()]
+    backend = make_backend(project, args.model, args.think)
+    results = []
+    for case in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shutil.copytree(project.design, root / "design")
+            (root / "tools").mkdir()
+            if project.reference.exists():
+                shutil.copy(project.reference, root / "tools" / "REFERENCE.md")
+            sub = Project(root)
+            if case.get("setup"):
+                run_ops(sub, case["setup"], note=case.get("history", ""), wait=False, quiet=True)
+            if case.get("select"):
+                write_atomic(sub.live / "selection.json", compact({"id": case["select"], "at": time.time() + 1}))
+            base = Design(sub)
+            t0 = time.time()
+            escalated, error, first_try = False, "", True
+            try:
+                context = build_context(sub, request=case["request"])
+                system = system_prompt(sub)
+                calls = []
+
+                class Counting(Backend):
+                    name, model = backend.name, backend.model
+
+                    def complete(self, s, m, n):
+                        calls.append(1)
+                        return backend.complete(s, m, n)
+
+                ops, say, _ = request_ops(sub, Counting(), context, system, case["request"])
+                first_try = len(calls) == 1
+                if ops:
+                    run_ops(sub, ops, note=case["request"], wait=False, quiet=True)
+                else:
+                    escalated = True
+            except UIError as e:
+                error = str(e)[:160]
+            secs = time.time() - t0
+            after = Design(sub)
+            fails = [] if error else [r for r in (_check(after, base, exp, escalated) for exp in case["expect"]) if r]
+            ok = not error and not fails
+            results.append({"name": case.get("name"), "ok": ok, "first_try": first_try and not error,
+                            "secs": round(secs, 2), "why": error or "; ".join(fails)})
+            mark = "PASS" if ok else "FAIL"
+            print(f"{mark}  {secs:5.2f}s  {case.get('name')}" + ("" if ok else f"   — {results[-1]['why']}"))
+    n = len(results) or 1
+    secs = sorted(r["secs"] for r in results)
+    p = lambda q: secs[min(len(secs) - 1, int(q * len(secs)))] if secs else 0
+    print(f"\npass {sum(r['ok'] for r in results)}/{len(results)}  ·  valid first try "
+          f"{sum(r['first_try'] for r in results)}/{len(results)}  ·  latency p50 {p(.5):.2f}s p90 {p(.9):.2f}s"
+          f"  ·  {backend.name} {backend.model}")
+    write_atomic(project.live / "eval-last.json", dump(results))
+    return 0 if all(r["ok"] for r in results) else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ui", description="Live UI engine: edit design/*.json fast and safely.",
                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n\n")[1])
@@ -2761,6 +2936,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("reference", help="print the ops / node reference")
     sub.add_parser("hook", help="Claude Code hook entry point (reads hook JSON on stdin)")
 
+    s = sub.add_parser("eval", help="measure model accuracy + latency on tools/evals.jsonl (one call per case)")
+    s.add_argument("--file", help="cases file (default tools/evals.jsonl)")
+    s.add_argument("--only", help="run cases whose name contains this text")
+    s.add_argument("--model", default=os.environ.get("UI_MODEL", DEFAULT_MODEL))
+    s.add_argument("--think", action="store_true")
+
     for name in ("ask", "chat"):
         s = sub.add_parser(name, help="one model call -> ops -> applied" if name == "ask" else "interactive loop")
         if name == "ask":
@@ -2791,7 +2972,7 @@ def main(argv=None) -> int:
     handlers = {
         "context": cmd_context, "apply": cmd_apply, "undo": cmd_undo, "pick": cmd_pick, "status": cmd_status,
         "shot": cmd_shot, "validate": cmd_validate, "reference": cmd_reference, "ask": cmd_ask, "chat": cmd_chat,
-        "keep": cmd_keep, "stats": cmd_stats, "tune": cmd_tune, "hook": cmd_hook,
+        "keep": cmd_keep, "stats": cmd_stats, "tune": cmd_tune, "hook": cmd_hook, "eval": cmd_eval,
         "next": lambda pr, a: cmd_variant_step(pr, a, 1),
         "prev": lambda pr, a: cmd_variant_step(pr, a, -1),
     }

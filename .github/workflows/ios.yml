@@ -59,20 +59,22 @@ jobs:
 
       - name: Hot-reload smoke test
         working-directory: ${{ runner.temp }}/Demo
+        timeout-minutes: 15
         run: |
           set -euo pipefail
+          t() { perl -e 'alarm shift @ARGV; exec @ARGV' "$@"; }   # per-command timeout (no coreutils on macOS)
           UDID="$(xcrun simctl list devices available | grep -E '^\s+iPhone' | head -1 | grep -oE '[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}')"
           echo "device $UDID"
           mkdir -p .live && echo "$UDID" > .live/device
           xcrun simctl boot "$UDID" || true
-          xcrun simctl bootstatus "$UDID" -b
+          t 600 xcrun simctl bootstatus "$UDID" -b
           xcrun simctl install "$UDID" build/Build/Products/Debug-iphonesimulator/Demo.app
           SIMCTL_CHILD_UI_PROJECT_DIR="$PWD" xcrun simctl launch "$UDID" com.example.Demo -UIProjectDir "$PWD"
           for i in $(seq 1 150); do [ -f .live/status.json ] && break; sleep 0.2; done
           cat .live/status.json
           ./ui status
           sleep 4
-          xcrun simctl io "$UDID" screenshot .live/1-launch.png
+          t 60 xcrun simctl io "$UDID" screenshot .live/1-launch.png || echo "screenshot timed out"
 
           # 1) token + text change: the app must confirm the new revision
           ./ui apply --shot <<'OPS'
@@ -82,7 +84,7 @@ jobs:
             {"op": "insert", "after": "home.hero.subtitle", "node": {"type": "text", "text": "Added live, no rebuild"}}
           ]}
           OPS
-          cp .live/shot.png .live/2-after-apply.png
+          cp .live/shot.png .live/2-after-apply.png || true
 
           # 2) invalid ops are rejected before they reach the app (exit 1)
           if ./ui apply '{"op":"set","id":"nope","props":{"text":"x"}}'; then echo "invalid op was accepted"; exit 1; fi
@@ -90,7 +92,7 @@ jobs:
           # 3) undo restores the design
           ./ui undo
           sleep 1
-          xcrun simctl io "$UDID" screenshot .live/3-after-undo.png
+          t 60 xcrun simctl io "$UDID" screenshot .live/3-after-undo.png || echo "screenshot timed out"
 
           python3 - <<'PY'
           import json, sys
