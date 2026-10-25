@@ -115,3 +115,4 @@ jobs:
             ${{ runner.temp }}/Demo/.live/status.json
             ${{ runner.temp }}/Demo/build.log
           if-no-files-found: warn
+          include-hidden-files: true   # screenshots live in .live/
