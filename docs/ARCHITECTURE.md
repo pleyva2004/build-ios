@@ -137,7 +137,7 @@ the CLI startup of a fresh `claude -p` process (~2–3 s) is not included in the
   - an invalid op is rejected;
   - undo restores `design/` byte-for-byte;
   - before/after screenshots are uploaded.
-- `./ui eval` measures the model itself. `tools/evals.jsonl` holds 24 natural-language requests: scope, layout, repeat template vs. row data, toolbar insert, follow-ups and must-escalate cases. Each is checked by assertions on the resulting design, and the report gives pass rate, valid-first-try rate and p50/p90 latency per model. On Haiku (through `claude -p`), all 24 produced valid ops on the first try. The first run passed 21/24, which exposed a nudge bug at the top of the radius scale and the undocumented `path` op. After those fixes, 23/24 passed, and the remaining case was a too-strict check (a larger font token is also "bigger").
+- `./ui eval` measures the model itself. `tools/evals.jsonl` holds 24 natural-language requests: scope, layout, repeat template vs. row data, toolbar insert, follow-ups and must-escalate cases. Each is checked by assertions on the resulting design, and the report gives pass rate, valid-first-try rate and p50/p90 latency per model. On Haiku (through `claude -p`), all 24 produced valid ops on the first try. The first run passed 21/24, which exposed a nudge bug at the top of the radius scale and the undocumented `path` op. After fixing those, and a too-strict check (a larger font token is also "bigger"), it passes 24/24 at a 5.8 s p50 (including CLI startup).
 - Live Claude Code runs on a scaffolded app (with a stand-in for the Simulator that confirms renders) checked the integration:
   - the `UserPromptSubmit` context hook;
   - `/ui` switching to Haiku;

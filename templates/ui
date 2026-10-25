@@ -1379,11 +1379,13 @@ class Applier:
             raise UIError(f"prop must be one of {', '.join(NUDGE_PROPS)}")
         if not isinstance(by, int) or isinstance(by, bool) or by == 0:
             raise UIError("by must be a non-zero integer (steps)")
+        if abs(by) > 20:
+            raise UIError("by must be between -20 and 20 steps; use set for a specific value")
         loc = self.d.find(nid)
         value = nudge_value(self.d, loc.node, prop, by)
         if nudge_is_noop(self.d, loc.node, prop, value):
-            raise UIError(f"{nid}: {prop} is already at its {'largest' if by > 0 else 'smallest'} step; "
-                          f"use set with an explicit value")
+            raise UIError(f"{nid}: nudging {prop} {'up' if by > 0 else 'down'} would change nothing "
+                          f"(it is at its limit); use set with an explicit value")
         if isinstance(value, tuple) and value[0] == "controlSize":
             loc.node["controlSize"] = value[1]
             change = f"controlSize → {value[1]}"
@@ -1434,8 +1436,9 @@ class Applier:
 
 def step_scale(scale: list, current: float, by: int, extend: bool = False) -> float:
     """Moves `by` steps along a sorted scale from the nearest point to `current`.
-    With `extend`, steps past either end continue as plain numbers (x1.3 / x0.7),
-    so "rounder" on the largest radius token still changes something."""
+    With `extend`, steps past either end continue as plain numbers (x1.3 up,
+    x0.7 down), so "rounder" on the largest radius token still changes something.
+    A value above the scale always comes back down by /1.3, mirroring the way up."""
     value = current
     for _ in range(abs(by)):
         if by > 0:
@@ -1444,119 +1447,191 @@ def step_scale(scale: list, current: float, by: int, extend: bool = False) -> fl
                 value = bigger[0]
             elif extend:
                 value = float(max(value + 1, round(value * 1.3)))
+        elif value > scale[-1] + 1e-9:
+            value = float(max(scale[-1], round(value / 1.3)))
         else:
             smaller = [v for v in scale if v < value - 1e-9]
             if smaller:
                 value = smaller[-1]
             elif extend:
-                value = float(max(0, round(value * 0.7)))
+                value = float(max(0, int(value * 0.7)))
     return value
 
 
-def effective_text_size(design: Design, node: dict) -> float:
-    """The point size a text node renders at: `size`, else its font (own or style's)."""
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _tidy(v):
+    return int(v) if _is_num(v) and float(v).is_integer() else v
+
+
+def style_merged(design: Design, node: dict) -> dict:
+    """The node's props over its style bundle — what the renderer reads (LiveTheme.effectiveProps)."""
     tokens = design.tokens if isinstance(design.tokens, dict) else {}
     styles = tokens.get("styles") if isinstance(tokens.get("styles"), dict) else {}
-    style = styles.get(str(node.get("style", "")).lstrip("$"), {}) if node.get("style") else {}
-    style = style if isinstance(style, dict) else {}
-    size = node.get("size", style.get("size"))
-    if isinstance(size, (int, float)) and not isinstance(size, bool):
-        return float(size)
-    font = node.get("font", style.get("font"))
-    if isinstance(font, str) and font.startswith("$"):
-        font = (tokens.get("fonts") or {}).get(font[1:])
-    if isinstance(font, dict) and isinstance(font.get("size"), (int, float)):
-        return float(font["size"])
-    return float(TEXT_STYLE_SIZES.get(font, 17)) if isinstance(font, str) else 17.0
+    raw = node.get("style")
+    bundle = styles.get(raw[1:] if raw.startswith("$") else raw) if isinstance(raw, str) else None
+    if not isinstance(bundle, dict):
+        return node
+    merged = {k: v for k, v in bundle.items() if k != "style"}
+    merged.update({k: v for k, v in node.items() if k != "style"})
+    return merged
+
+
+TEXT_STYLE_WEIGHTS = {"headline": "semibold"}
+
+
+def resolve_font(design: Design, props: dict) -> tuple:
+    """(size, weight) a text renders with, mirroring LiveTheme.font: follows `$token`
+    chains (4 hops) to a text style name or a {size, weight, style} object; the
+    element's own `size` / `weight` win. Unknown -> body (17, regular)."""
+    tokens = design.tokens if isinstance(design.tokens, dict) else {}
+    fonts = tokens.get("fonts") if isinstance(tokens.get("fonts"), dict) else {}
+    size = weight = style_name = None
+    spec = props.get("font")
+    depth = 0
+    while isinstance(spec, str) and depth < 4:
+        depth += 1
+        if spec.startswith("$"):
+            spec = fonts.get(spec[1:])
+        else:
+            style_name, spec = spec, None
+    if isinstance(spec, dict):
+        size = float(spec["size"]) if _is_num(spec.get("size")) else None
+        weight = spec.get("weight") if isinstance(spec.get("weight"), str) else None
+        style_name = spec.get("style") if isinstance(spec.get("style"), str) else style_name
+    if _is_num(props.get("size")):
+        size = float(props["size"])
+    if isinstance(props.get("weight"), str):
+        weight = props["weight"]
+    if size is None:
+        size = float(TEXT_STYLE_SIZES.get(style_name, 17))
+    if weight is None:
+        weight = TEXT_STYLE_WEIGHTS.get(style_name, "regular")
+    return size, weight
+
+
+def effective_text_size(design: Design, node: dict) -> float:
+    """The point size a text node renders at (explicit size, else its font)."""
+    return resolve_font(design, style_merged(design, node))[0]
+
+
+CONTROL_SIZES = ["mini", "small", "regular", "large", "extraLarge"]
+
+
+def _default_radius(node: dict, props: dict):
+    """What the renderer draws when `radius` is missing (None = square corners)."""
+    if node.get("type") == "shape" and props.get("shape") == "rounded":
+        return 12.0
+    if node.get("type") == "button" and props.get("variant"):
+        return 12.0  # system button shape; close enough to step from
+    if props.get("glass"):
+        return 20.0
+    return None
+
+
+def token_points(design: Design, prop: str, name: str):
+    """A $token's points the way LiveTheme.number resolves it: the prop's own group
+    first, then spacing, then radius (so radius "$xl" uses spacing.xl)."""
+    tokens = design.tokens if isinstance(design.tokens, dict) else {}
+    own = "radius" if prop == "radius" else "spacing"
+    for group in (own, "spacing", "radius"):
+        g = tokens.get(group)
+        if isinstance(g, dict) and name in g:
+            return float(g[name]) if _is_num(g[name]) else None
+    return None
+
+
+def nudge_current(design: Design, node: dict, prop: str):
+    """The element's current value for a nudge, as it renders (style merged, tokens
+    resolved to points). Shared by nudge_value and nudge_is_noop so they agree."""
+    p = style_merged(design, node)
+    if prop == "size" and node.get("type") == "button":
+        c = p.get("controlSize")
+        return ("controlSize", c if c in CONTROL_SIZES else "regular")
+    if prop == "size" and node.get("type") == "image" and "symbol" not in p:
+        return ("frame", {k: p[k] for k in ("width", "height") if _is_num(p.get(k))})
+    if prop == "size":
+        return resolve_font(design, p)[0]
+    if prop == "weight":
+        return resolve_font(design, p)[1]
+    if prop in ("padding", "spacing", "radius"):
+        cur = p.get(prop)
+        if isinstance(cur, dict):
+            raise UIError(f"{prop} is per-edge here; use set")
+        if isinstance(cur, str) and cur.startswith("$"):
+            cur = token_points(design, prop, cur[1:])
+        if _is_num(cur):
+            return float(cur)
+        if prop == "spacing":
+            return 8.0  # SwiftUI's default gap between stacked views
+        if prop == "radius":
+            return _default_radius(node, p) or 0.0
+        return 0.0
+    if prop == "opacity":
+        return float(p["opacity"]) if _is_num(p.get("opacity")) else 1.0
+    if prop in ("width", "height"):
+        return float(p[prop]) if _is_num(p.get(prop)) else None
+    raise UIError(f"cannot nudge '{prop}' (use one of {', '.join(NUDGE_PROPS)})")
+
+
+def _points(design: Design, prop: str, v):
+    """Resolves a nudge result to comparable points ($tokens -> numbers)."""
+    if isinstance(v, str) and v.startswith("$") and prop in ("padding", "spacing", "radius"):
+        found = token_points(design, prop, v[1:])
+        v = found if found is not None else v
+    return float(v) if _is_num(v) else v
 
 
 def nudge_is_noop(design: Design, node: dict, prop: str, value) -> bool:
-    """True when a nudge would leave the element looking the same (end of a scale)."""
-    if isinstance(value, tuple) and value[0] == "controlSize":
-        return node.get("controlSize", "regular") == value[1]
-    if isinstance(value, tuple):
-        return all(node.get(k) == v for k, v in value[1].items())
-    tokens = design.tokens if isinstance(design.tokens, dict) else {}
-    styles = tokens.get("styles") if isinstance(tokens.get("styles"), dict) else {}
-    style = styles.get(str(node.get("style", "")).lstrip("$"), {}) if node.get("style") else {}
-    cur = node.get(prop, style.get(prop) if isinstance(style, dict) else None)
-    if cur is None and prop == "opacity":
-        cur = 1.0
-    if cur is None and prop == "size":
-        font = node.get("font", style.get("font") if isinstance(style, dict) else None)
-        if isinstance(font, str) and font.startswith("$"):
-            font = (tokens.get("fonts") or {}).get(font[1:])
-        cur = font.get("size") if isinstance(font, dict) else TEXT_STYLE_SIZES.get(font, 17) if isinstance(font, str) else 17
-    return cur == value
+    """True when a nudge would leave the element looking the same (at a limit)."""
+    return _points(design, prop, nudge_current(design, node, prop)) == _points(design, prop, value)
+
+
+def _step_mult(v: float, factor: float, by: int) -> int:
+    """Multiplicative step that moves at least 1 pt per step (floor 1)."""
+    n = round(v * (factor ** by))
+    n = max(v + by, n) if by > 0 else min(v + by, n)
+    return int(max(1, n))
 
 
 def nudge_value(design: Design, node: dict, prop: str, by: int):
     """Next value for a relative change ("bigger", "more space"), on the design's own scales."""
-    tokens = design.tokens if isinstance(design.tokens, dict) else {}
-    styles = tokens.get("styles") if isinstance(tokens.get("styles"), dict) else {}
-    style = styles.get(str(node.get("style", "")).lstrip("$"), {}) if node.get("style") else {}
-    cur = node.get(prop, style.get(prop) if isinstance(style, dict) else None)
-    font = node.get("font", style.get("font") if isinstance(style, dict) else None)
-    if isinstance(font, str) and font.startswith("$"):
-        font = (tokens.get("fonts") or {}).get(font[1:])
-    if prop == "size" and node.get("type") == "button":
-        ladder = ["mini", "small", "regular", "large", "extraLarge"]
-        c = node.get("controlSize") if node.get("controlSize") in ladder else "regular"
-        return ("controlSize", ladder[max(0, min(len(ladder) - 1, ladder.index(c) + by))])
-    if prop == "size" and node.get("type") == "image" and "symbol" not in node:
-        w, h = node.get("width"), node.get("height")
-        if not isinstance(w, (int, float)) and not isinstance(h, (int, float)):
+    cur = nudge_current(design, node, prop)
+    if isinstance(cur, tuple) and cur[0] == "controlSize":
+        i = CONTROL_SIZES.index(cur[1])
+        return ("controlSize", CONTROL_SIZES[max(0, min(len(CONTROL_SIZES) - 1, i + by))])
+    if isinstance(cur, tuple):
+        if not cur[1]:
             raise UIError("image has no width/height to scale; set them first")
-        out = {}
-        for key, val in (("width", w), ("height", h)):
-            if isinstance(val, (int, float)) and not isinstance(val, bool):
-                out[key] = max(1, round(val * (1.25 ** by)))
-        return ("frame", out)
+        return ("frame", {k: _step_mult(v, 1.25, by) for k, v in cur[1].items()})
     if prop == "size":
-        size = cur if isinstance(cur, (int, float)) and not isinstance(cur, bool) else None
-        if size is None:
-            if isinstance(font, dict) and isinstance(font.get("size"), (int, float)):
-                size = font["size"]
-            elif isinstance(font, str):
-                size = TEXT_STYLE_SIZES.get(font, 17)
-            else:
-                size = 17
         # bigger keeps growing past the scale; smaller stops at 11 pt (legibility)
-        out = min(400.0, step_scale(TYPE_SCALE, float(size), by, extend=by > 0))
-        return int(out) if float(out).is_integer() else out
+        return _tidy(min(400.0, step_scale(TYPE_SCALE, cur, by, extend=by > 0)))
     if prop in ("padding", "spacing", "radius"):
+        tokens = design.tokens if isinstance(design.tokens, dict) else {}
         group = (tokens.get("radius") if prop == "radius" else tokens.get("spacing")) or {}
-        named = sorted(((v, k) for k, v in group.items() if isinstance(v, (int, float)) and v < 500))
-        if isinstance(cur, dict):
-            raise UIError(f"{prop} is per-edge here; use set")
-        value = None
-        if isinstance(cur, str) and cur.startswith("$"):
-            value = group.get(cur[1:])
-        elif isinstance(cur, (int, float)) and not isinstance(cur, bool):
-            value = cur
+        named = sorted(((v, k) for k, v in group.items() if _is_num(v) and v < 500))
         if not named:
-            return max(0, (value or 0) + 4 * by)
-        scale = [v for v, _ in named]
-        if value is None:
-            value = scale[0] - 1 if by > 0 else scale[0]
-        target = step_scale(scale, float(value), by, extend=True)
+            return _tidy(max(0.0, cur + 4 * by))
+        if prop == "radius" and by > 0 and cur >= 500:
+            return _tidy(cur)  # already a capsule; rejected as a no-op
+        target = step_scale([v for v, _ in named], cur, by, extend=True)
+        if prop == "radius" and target >= 500:  # snap to the pill token instead of growing forever
+            pill = next((k for k, v in group.items() if _is_num(v) and v >= 500), None)
+            return f"${pill}" if pill else 499
         names = dict((v, k) for v, k in named)
-        if target in names:
-            return "$" + names[target]
-        return int(target) if float(target).is_integer() else target
+        return f"${names[target]}" if target in names else _tidy(target)
     if prop == "weight":
-        if cur not in WEIGHT_ORDER:  # start from the font's weight, so "bolder" never lightens
-            cur = font.get("weight") if isinstance(font, dict) else ("semibold" if font == "headline" else None)
         w = cur if cur in WEIGHT_ORDER else "regular"
-        i = max(0, min(len(WEIGHT_ORDER) - 1, WEIGHT_ORDER.index(w) + by))
-        return WEIGHT_ORDER[i]
+        return WEIGHT_ORDER[max(0, min(len(WEIGHT_ORDER) - 1, WEIGHT_ORDER.index(w) + by))]
     if prop == "opacity":
-        o = cur if isinstance(cur, (int, float)) and not isinstance(cur, bool) else 1.0
-        return round(max(0.0, min(1.0, o + 0.1 * by)), 2)
+        return round(max(0.0, min(1.0, cur + 0.1 * by)), 2)
     if prop in ("width", "height"):
-        if not isinstance(cur, (int, float)) or isinstance(cur, bool):
+        if cur is None:
             raise UIError(f"{prop} has no numeric value to nudge; use set")
-        return max(1, round(cur * (1.15 ** by)))
+        return _step_mult(cur, 1.15, by)
     raise UIError(f"cannot nudge '{prop}' (use one of {', '.join(NUDGE_PROPS)})")
 
 
@@ -1938,9 +2013,13 @@ def build_context(project: Project, screen: str = None, request: str = "") -> st
     tabs = d.app.get("tabs")
     nav = ""
     if isinstance(tabs, list):
-        nav = "tabs (app.json): " + ", ".join(
-            f"{i} {t.get('id')} \"{t.get('title', '')}\"→{t.get('screen', t.get('id'))}"
-            for i, t in enumerate(tabs) if isinstance(t, dict))
+        def tab_label(i, t):
+            scr = t.get("screen") if isinstance(t.get("screen"), str) else str(t.get("id", ""))
+            title = t.get("title")
+            if not isinstance(title, str):  # the app shows the capitalized screen name (LiveSpec)
+                title = " ".join(w[:1].upper() + w[1:].lower() for w in scr.split(" "))
+            return f"{i} {t.get('id')} {json.dumps(title, ensure_ascii=False)}→{scr}"
+        nav = "tabs (app.json): " + ", ".join(tab_label(i, t) for i, t in enumerate(tabs) if isinstance(t, dict))
     elif d.app.get("root"):
         nav = f"root: {d.app.get('root')}"
     L.append(f"# app {d.app.get('name', '')}  ({nav})")
@@ -2189,24 +2268,51 @@ class ClaudeCLIBackend(Backend):
         # hooks and CLAUDE.md (run outside it), MCP servers and skills. Halves the tokens.
         lean = ["--setting-sources", "user", "--strict-mcp-config", "--disable-slash-commands",
                 "--no-session-persistence"]
+        forwarded = self.project_auth_settings()
+        if forwarded:  # provider/auth set in the project still applies (e.g. Bedrock env, apiKeyHelper)
+            lean += ["--settings", compact(forwarded)]
         env = dict(os.environ, UI_NO_CONTEXT_HOOK="1")
         try:
             proc = subprocess.run(cmd + lean, input=prompt, capture_output=True, text=True, timeout=120,
                                   cwd=tempfile.gettempdir(), env=env)
-            if proc.returncode != 0 and "unknown option" in (proc.stderr or ""):  # older Claude Code
+            if proc.returncode != 0 and "unknown option" in (proc.stderr or "").lower():
+                # older Claude Code: plain flags, from the project so its settings load
                 proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=120,
-                                      cwd=tempfile.gettempdir(), env=env)
+                                      cwd=str(self.project.root), env=env)
         except FileNotFoundError:
             raise UIError("`claude` not found on PATH")
         except subprocess.TimeoutExpired:
             raise UIError("claude -p timed out")
-        if proc.returncode != 0:
-            raise UIError(f"claude -p failed: {(proc.stderr or proc.stdout).strip()[:400]}")
         try:
             data = json.loads(proc.stdout)
         except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict) and (proc.returncode != 0 or data.get("is_error")):
+            # e.g. "Not logged in · Please run /login" — it sits at the end of the JSON
+            status = f" (HTTP {data['api_error_status']})" if data.get("api_error_status") else ""
+            raise UIError(f"claude -p failed: {data.get('result') or data.get('subtype') or 'unknown error'}{status}")
+        if proc.returncode != 0:
+            raise UIError(f"claude -p failed: {(proc.stderr or proc.stdout).strip()[-400:]}")
+        if not isinstance(data, dict):
             return proc.stdout
         return data.get("result") or ""
+
+    def project_auth_settings(self) -> dict:
+        """`env` and `apiKeyHelper` from the project's .claude settings (local wins), which
+        --setting-sources user would otherwise drop."""
+        out: dict = {}
+        for name in ("settings.json", "settings.local.json"):
+            try:
+                data = read_json(self.project.root / ".claude" / name)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if isinstance(data.get("env"), dict):
+                out.setdefault("env", {}).update({str(k): str(v) for k, v in data["env"].items()})
+            if isinstance(data.get("apiKeyHelper"), str):
+                out["apiKeyHelper"] = data["apiKeyHelper"]
+        return out
 
 
 def make_backend(project: Project, model: str, think: bool) -> Backend:
@@ -2428,6 +2534,13 @@ def cmd_context(project: Project, args) -> int:
 
 
 def cmd_apply(project: Project, args) -> int:
+    end_turn = getattr(args, "end_turn", False)
+    if end_turn:
+        # A rejected call must not leave an older record for the end-turn hook to report.
+        try:
+            (Live(project).dir / "last-apply.json").unlink()
+        except FileNotFoundError:
+            pass
     raw = args.ops
     if raw in (None, "-"):
         raw = sys.stdin.read()
@@ -2437,12 +2550,13 @@ def cmd_apply(project: Project, args) -> int:
             env = json.loads(raw)
             if isinstance(env, dict) and isinstance(env.get("say"), str):
                 note = env["say"]
-                if env.get("ops") == [] and args.end_turn:
+                if env.get("ops") == [] and end_turn:
                     # Claude Code ignores `continue: false` from PostToolUseFailure hooks,
                     # so an escalation that should end the turn succeeds (exit 0) and the
                     # PostToolUse hook stops the turn with this message.
-                    write_atomic(Live(project).dir / "last-apply.json",
-                                 compact({"at": time.time(), "say": note, "escalate": note or "needs Swift"}))
+                    with project_lock(project):
+                        write_atomic(Live(project).dir / "last-apply.json",
+                                     compact({"at": time.time(), "say": note, "escalate": note or "needs Swift"}))
                     print(f"ESCALATE: {note}\n  {ESCALATE_HINT}")
                     return 0
                 if env.get("ops") == []:
@@ -2761,6 +2875,10 @@ def cmd_hook(project: Project, args) -> int:
             info = Live(project).read("last-apply.json") or {}
             if not info or time.time() - float(info.get("at", 0)) > 60:
                 return 0
+            say = info.get("say") or ""
+            command = str(ti.get("command", ""))
+            if say and say not in command and json.dumps(say)[1:-1] not in command:
+                return 0  # the record is from another call (e.g. ./ui tune in a terminal)
             if info.get("escalate"):
                 print(compact({"continue": False, "stopReason":
                                f"ESCALATE: {info['escalate']} (needs a Swift component — see CLAUDE.md)"}))

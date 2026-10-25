@@ -244,6 +244,76 @@ class NudgeOpTest(ProjectCase):
             self.apply({"op": "nudge", "id": "home.scroll", "prop": "spacing", "by": -1})
         self.assertEqual(self.nudge("home.scroll", "spacing")["spacing"], "$xs")
 
+    def test_steps_past_the_scale_reverse_cleanly(self):
+        self.apply({"op": "set", "id": "home.section", "props": {"size": 64}})
+        self.assertEqual(self.nudge("home.section", "size", 3)["size"], 140)
+        self.assertEqual(self.nudge("home.section", "size", -1)["size"], 108)
+        self.apply({"op": "set", "id": "home.section", "props": {"size": 400}})
+        self.assertEqual(self.nudge("home.section", "size", -1)["size"], 308)
+        self.apply({"op": "set", "id": "home.story.image", "props": {"radius": 49}})
+        self.assertEqual(self.nudge("home.story.image", "radius", -1)["radius"], 38)
+        self.assertEqual(self.nudge("home.story.image", "radius", -2)["radius"], "$lg")
+
+    def test_spacing_reaches_zero_then_stops(self):
+        self.apply({"op": "set", "id": "home.scroll", "props": {"spacing": "$xs"}})
+        self.assertEqual(self.nudge("home.scroll", "spacing", -3)["spacing"], 0)
+        with self.assertRaises(ui.UIError):
+            self.apply({"op": "nudge", "id": "home.scroll", "prop": "spacing", "by": -1})
+
+    def test_more_spacing_from_the_default_gap_grows(self):
+        self.apply({"op": "set", "id": "home.scroll", "props": {"spacing": None}})
+        self.assertEqual(self.nudge("home.scroll", "spacing")["spacing"], "$md")  # default gap is ~8
+
+    def test_less_padding_or_radius_where_there_is_none_is_rejected(self):
+        for nid, prop in (("home.hero.title", "padding"), ("home.section", "radius")):
+            with self.assertRaises(ui.UIError) as cm:
+                self.apply({"op": "nudge", "id": nid, "prop": prop, "by": -1})
+            self.assertIn("would change nothing", str(cm.exception))
+            self.assertNotIn(prop, self.node(nid))
+
+    def test_pill_radius_does_not_grow_forever(self):
+        self.apply({"op": "set", "id": "home.hero.cta", "props": {"radius": "$pill"}})
+        with self.assertRaises(ui.UIError):
+            self.apply({"op": "nudge", "id": "home.hero.cta", "prop": "radius"})
+        self.apply({"op": "set", "id": "home.hero.cta", "props": {"radius": 400}})
+        self.assertEqual(self.nudge("home.hero.cta", "radius")["radius"], "$pill")
+
+    def test_radius_from_a_spacing_token_resolves_like_the_renderer(self):
+        self.apply({"op": "set", "id": "home.story.image", "props": {"radius": "$xl"}})  # spacing.xl = 32
+        self.assertEqual(self.nudge("home.story.image", "radius", -1)["radius"], 25)  # above the scale: /1.3
+        self.assertEqual(self.nudge("home.story.image", "radius", -1)["radius"], "$lg")
+        self.apply({"op": "set", "id": "home.story.image", "props": {"radius": "$xl"}})
+        self.assertEqual(self.nudge("home.story.image", "radius")["radius"], 42)
+
+    def test_nudge_steps_are_bounded(self):
+        for by in (21, 3000, -10 ** 9):
+            with self.assertRaises(ui.UIError) as cm:
+                self.apply({"op": "nudge", "id": "home.section", "prop": "size", "by": by})
+            self.assertIn("between -20 and 20", str(cm.exception))
+
+    def test_font_token_chains_and_style_objects(self):
+        self.apply({"op": "token", "path": "fonts.hero", "value": "$largeTitle"})
+        self.apply({"op": "set", "id": "home.hero.title", "props": {"font": "$hero"}})
+        self.assertEqual(ui.effective_text_size(ui.Design(self.project), self.node("home.hero.title")), 34)
+        self.apply({"op": "set", "id": "home.hero.title", "props": {"font": {"style": "largeTitle", "weight": "bold"}}})
+        self.assertEqual(ui.effective_text_size(ui.Design(self.project), self.node("home.hero.title")), 34)
+        self.assertEqual(self.nudge("home.hero.title", "size", -1)["size"], 28)
+
+    def test_noop_follows_font_weight_and_style_control_size(self):
+        self.apply({"op": "token", "path": "fonts.title.weight", "value": "black"})
+        with self.assertRaises(ui.UIError):
+            self.apply({"op": "nudge", "id": "home.hero.title", "prop": "weight"})
+        self.apply({"op": "token", "path": "styles.big", "value": {"controlSize": "extraLarge"}})
+        self.apply({"op": "set", "id": "home.hero.cta", "props": {"style": "big", "controlSize": None}})
+        with self.assertRaises(ui.UIError):
+            self.apply({"op": "nudge", "id": "home.hero.cta", "prop": "size"})
+        self.assertEqual(self.nudge("home.hero.cta", "size", -1)["controlSize"], "large")
+
+    def test_small_frames_always_move(self):
+        self.apply({"op": "set", "id": "home.hero", "props": {"height": 3}})
+        self.assertEqual(self.nudge("home.hero", "height")["height"], 4)
+        self.assertEqual(self.nudge("home.hero", "height", -2)["height"], 2)
+
     def test_size_keeps_growing_past_the_type_scale(self):
         self.apply({"op": "set", "id": "home.section", "props": {"size": 64}})
         self.assertEqual(self.nudge("home.section", "size")["size"], 83)
@@ -1175,6 +1245,12 @@ class ContextTest(ProjectCase):
         ctx = ui.build_context(self.project)
         self.assertIn('# app Demo  (tabs (app.json): 0 home "Home"→home, 1 explore "Explore"→explore, '
                       '2 profile "Profile"→profile)', ctx)
+        app = json.loads((self.root / "design" / "app.json").read_text())
+        app["tabs"][0]["title"] = 'Say "Hi"'
+        del app["tabs"][1]["title"]
+        (self.root / "design" / "app.json").write_text(json.dumps(app), encoding="utf-8")
+        ctx = ui.build_context(self.project)
+        self.assertIn('0 home "Say \\"Hi\\""→home, 1 explore "Explore"→explore', ctx)
         self.assertIn("# simulator: app not running", ctx)
         self.assertIn("## screen home  (design/screens/home.json)", ctx)
         self.assertIn('home.hero.title text text="Good morning" font="$title" foreground="$text"', ctx)
@@ -1357,7 +1433,8 @@ class HookTest(ProjectCase):
         self.assertIn("ESCALATE: maps need Swift", stop["stopReason"])
         # a later successful apply is not mistaken for an escalation
         self.apply({"op": "set", "id": "home.hero.title", "props": {"text": "Hi"}}, note="Friendlier")
-        self.assertNotIn("ESCALATE", json.loads(self.post_bash(cmd)[1])["stopReason"])
+        later = "./ui apply --end-turn <<'OPS'\n{\"say\": \"Friendlier\", \"ops\": []}\nOPS"
+        self.assertNotIn("ESCALATE", json.loads(self.post_bash(later)[1])["stopReason"])
         # failures (rejected ops) never end the turn, so the model can retry
         self.assertEqual(self.hook({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
                                     "tool_input": {"command": cmd},
@@ -1409,14 +1486,32 @@ class HookTest(ProjectCase):
 
     def test_post_bash_end_turn(self):
         self.apply({"op": "set", "id": "home.hero.title", "props": {"text": "Hi"}}, note="Friendlier greeting")
-        code, out, _ = self.post_bash("./ui apply --end-turn <<'OPS'\n{}\nOPS")
+        cmd = "./ui apply --end-turn <<'OPS'\n{\"say\": \"Friendlier greeting\", \"ops\": []}\nOPS"
+        code, out, _ = self.post_bash(cmd)
         self.assertEqual(code, 0)
         data = json.loads(out)
         self.assertIs(data["continue"], False)
         self.assertIn("Friendlier greeting", data["stopReason"])
         self.assertIn("app not running", data["stopReason"])
-        self.assertEqual(self.post_bash("./ui apply <<'OPS'\n{}\nOPS"), (0, "", ""))
+        self.assertEqual(self.post_bash(cmd.replace(" --end-turn", "")), (0, "", ""))
         self.assertEqual(self.post_bash("./ui context --end-turn")[1], "")
+        # a record written by another call (say text not in this command) is ignored
+        self.assertEqual(self.post_bash("./ui apply --end-turn <<'OPS'\n{\"say\": \"Other\"}\nOPS"), (0, "", ""))
+
+    def test_rejected_end_turn_apply_clears_the_old_record(self):
+        good = argparse.Namespace(ops='{"say": "maps need Swift", "ops": []}', note=None, no_wait=False,
+                                  shot=False, end_turn=True)
+        with captured():
+            ui.cmd_apply(self.project, good)
+        self.assertTrue((self.live.dir / "last-apply.json").exists())
+        bad = argparse.Namespace(ops='{"say": "maps need Swift", "ops": [{"op": "set", "id": "nope"}]}',
+                                 note=None, no_wait=False, shot=False, end_turn=True)
+        with captured(), self.assertRaises(ui.UIError):
+            ui.cmd_apply(self.project, bad)
+        self.assertFalse((self.live.dir / "last-apply.json").exists())
+        # e.g. `./ui apply --end-turn <<'OPS' ... | tail -5` exits 0 even though apply failed
+        cmd = "./ui apply --end-turn <<'OPS'\n{\"say\": \"maps need Swift\", \"ops\": []}\nOPS"
+        self.assertEqual(self.post_bash(cmd), (0, "", ""))
 
     def test_post_bash_end_turn_needs_a_recent_apply(self):
         self.assertEqual(self.post_bash("./ui apply --end-turn <<'OPS'\n{}\nOPS"), (0, "", ""))
@@ -1425,6 +1520,57 @@ class HookTest(ProjectCase):
         info["at"] -= 120
         (self.live.dir / "last-apply.json").write_text(json.dumps(info))
         self.assertEqual(self.post_bash("./ui apply --end-turn <<'OPS'\n{}\nOPS"), (0, "", ""))
+
+
+class ClaudeCLIBackendTest(ProjectCase):
+    def run_with(self, *results):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append((cmd, kw))
+            code, out, err = results[min(len(calls), len(results)) - 1]
+            return subprocess.CompletedProcess(cmd, code, out, err)
+
+        backend = ui.ClaudeCLIBackend(self.project, ui.DEFAULT_MODEL)
+        with mock.patch.object(ui.subprocess, "run", side_effect=fake_run):
+            try:
+                return backend.complete("sys", [{"role": "user", "content": "hi"}], 100), calls
+            except ui.UIError as e:
+                return e, calls
+
+    def test_success_runs_lean_outside_the_project(self):
+        out, calls = self.run_with((0, json.dumps({"result": '{"ops": []}', "is_error": False}), ""))
+        self.assertEqual(out, '{"ops": []}')
+        cmd, kw = calls[0]
+        self.assertIn("--setting-sources", cmd)
+        self.assertNotIn("--settings", cmd)  # nothing to forward in a fresh scaffold
+        self.assertNotEqual(kw["cwd"], str(self.root))
+        self.assertEqual(kw["env"]["UI_NO_CONTEXT_HOOK"], "1")
+
+    def test_login_error_is_shown_not_the_json_prefix(self):
+        blob = json.dumps({"duration_api_ms": 0, "usage": {"x": "y" * 900}, "is_error": True,
+                           "api_error_status": 401, "result": "Not logged in · Please run /login"})
+        err, _ = self.run_with((1, blob, ""))
+        self.assertIsInstance(err, ui.UIError)
+        self.assertIn("Not logged in", str(err))
+        self.assertIn("HTTP 401", str(err))
+
+    def test_older_cli_retries_with_plain_flags_from_the_project(self):
+        out, calls = self.run_with((1, "", "error: unknown option '--strict-mcp-config'"),
+                                   (0, json.dumps({"result": "ok"}), ""))
+        self.assertEqual(out, "ok")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("--setting-sources", calls[1][0])
+        self.assertEqual(calls[1][1]["cwd"], str(self.root))
+
+    def test_project_provider_settings_are_forwarded(self):
+        (self.root / ".claude").mkdir(exist_ok=True)
+        (self.root / ".claude" / "settings.local.json").write_text(
+            json.dumps({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}, "apiKeyHelper": "~/bin/key"}), encoding="utf-8")
+        _, calls = self.run_with((0, json.dumps({"result": "ok"}), ""))
+        cmd = calls[0][0]
+        forwarded = json.loads(cmd[cmd.index("--settings") + 1])
+        self.assertEqual(forwarded, {"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}, "apiKeyHelper": "~/bin/key"})
 
 
 class EvalCheckTest(ProjectCase):
