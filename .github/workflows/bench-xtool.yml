@@ -1,0 +1,51 @@
+name: build benchmark (xcodebuild vs xtool)
+# Times clean / no-op / one-file-edit builds and install + launch of the scaffolded
+# app with xcodebuild (what run.sh does) and with xtool (SwiftPM-based). Manual, or
+# when the benchmark itself changes.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "scripts/bench_build.py"
+      - ".github/workflows/bench-xtool.yml"
+
+jobs:
+  bench:
+    runs-on: macos-26
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: |
+          XC="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          [ -n "$XC" ] && sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      - name: Install XcodeGen and xtool
+        run: |
+          brew install xcodegen
+          brew install xtool-org/tap/xtool || echo "xtool install failed"
+          which xtool && (xtool --version || xtool --help | head -5) || true
+
+      - name: Scaffold Demo app
+        run: bash scripts/scaffold.sh Demo "$RUNNER_TEMP" com.example
+
+      - name: Boot a Simulator
+        run: |
+          UDID="$(xcrun simctl list devices available | grep -E '^\s+iPhone' | head -1 | grep -oE '[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}')"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+
+      - name: Benchmark
+        timeout-minutes: 60
+        run: python3 scripts/bench_build.py "$RUNNER_TEMP/Demo" --runs 3 --udid "$UDID"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-benchmark
+          path: ${{ runner.temp }}/Demo/bench.json
+          if-no-files-found: warn
