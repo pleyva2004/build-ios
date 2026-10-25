@@ -21,10 +21,10 @@ Swift, no rebuild. Change it with **ops**: small JSON edits addressed by element
 | `text` | `text` |
 | `label` | `text`, `symbol` |
 | `image` | `symbol` (SF Symbol name) or `url` or `asset`; `fit` fill/fit, `aspect` (w/h) |
-| `button` | `text` and/or `symbol` (or `children`), `variant` primary/secondary/plain/borderless/destructive/glass/glassProminent, `action`, `controlSize` small/regular/large. With a variant, `tint` colors it and `radius` shapes it |
+| `button` | `text` and/or `symbol` (or `children`), `variant` primary/secondary/plain/borderless/destructive/glass/glassProminent, `action`, `controlSize` mini/small/regular/large/extraLarge. With a variant, `tint` colors it and `radius` shapes it |
 | `toggle` | `text`, `bind` (state key) |
-| `textfield` | `placeholder`, `bind`, `secure`, `keyboard` default/email/number/phone/url |
-| `picker` | `text`, `bind`, `options` [strings], `pickerStyle` segmented/menu/wheel |
+| `textfield` | `placeholder`, `bind`, `secure`, `keyboard` default/email/number/decimal/phone/url |
+| `picker` | `text`, `bind`, `options` [strings], `pickerStyle` segmented/menu/wheel/inline |
 | `shape` | `shape` rect/rounded/circle/capsule, `fill` |
 | `progress` | `value` 0–1 (omit = spinner) |
 | `spacer` · `divider` | — |
@@ -52,7 +52,7 @@ behavior: `onTap` (action), `visibleIf` (`"key"` · `"!key"` · `"key==value"`),
 | replace subtree | `{"op":"replace","id":ID,"node":{...}}` |
 | tokens & styles | `{"op":"token","path":"colors.brand","value":"#0EA5E9"}` · `"path":"styles.card.padding"` |
 | demo data | `{"op":"data","screen":"home","path":"stories.0.title","value":"…"}` (`"stories.-"` appends) |
-| new screen | `{"op":"screen","id":"settings","spec":{"title":"Settings","body":{...}}}` |
+| new screen | `{"op":"screen","id":"settings","spec":{"title":"Settings","body":{...}}}` (`"spec": null` deletes it) |
 
 New nodes may omit `id`. **Scope:** "this/it/that" → the focused element (`set`/`nudge`);
 "all cards / every button" → its **style** (`token` `styles.<name>.…`); "brand / theme /

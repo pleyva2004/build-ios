@@ -2446,6 +2446,12 @@ def cmd_status(project: Project, args) -> int:
 
 
 def cmd_shot(project: Project, args) -> int:
+    if args.path:
+        target = Path(args.path).resolve()
+        try:
+            target.relative_to(project.root.resolve())
+        except ValueError:
+            raise UIError("screenshots can only be written inside the project folder")
     print(take_screenshot(project, args.path, small=args.small))
     return 0
 

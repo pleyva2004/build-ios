@@ -1511,6 +1511,18 @@ class DriftTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class ShotPathTest(ProjectCase):
+    def test_screenshot_path_must_stay_inside_the_project(self):
+        outside = argparse.Namespace(path="/tmp/elsewhere.png", small=False)
+        with self.assertRaises(ui.UIError) as cm:
+            ui.cmd_shot(self.project, outside)
+        self.assertIn("inside the project", str(cm.exception))
+        inside = argparse.Namespace(path=str(self.root / ".live" / "x.png"), small=False)
+        with mock.patch.object(ui, "take_screenshot", return_value="ok") as shot, captured():
+            self.assertEqual(ui.cmd_shot(self.project, inside), 0)
+        shot.assert_called_once()
+
+
 class CliSmokeTest(ProjectCase):
     def run_ui(self, *args, stdin=None):
         env = dict(os.environ, UI_PROJECT_DIR=str(self.root), PYTHONDONTWRITEBYTECODE="1")
