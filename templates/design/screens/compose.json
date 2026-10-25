@@ -1,0 +1,40 @@
+{
+  "id": "compose",
+  "title": "New story",
+  "titleDisplay": "inline",
+  "toolbar": [
+    {
+      "type": "button",
+      "id": "compose.close",
+      "text": "Done",
+      "action": {
+        "dismiss": true
+      }
+    }
+  ],
+  "body": {
+    "type": "vstack",
+    "id": "compose.body",
+    "align": "leading",
+    "spacing": "$md",
+    "padding": "$md",
+    "children": [
+      {
+        "type": "textfield",
+        "id": "compose.title",
+        "placeholder": "Title",
+        "bind": "draftTitle"
+      },
+      {
+        "type": "text",
+        "id": "compose.hint",
+        "text": "Drafts are not saved in this demo.",
+        "style": "secondaryText"
+      },
+      {
+        "type": "spacer",
+        "id": "compose.spacer"
+      }
+    ]
+  }
+}

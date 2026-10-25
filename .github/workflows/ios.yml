@@ -1,0 +1,240 @@
+name: live-ui template
+
+# Compiles the scaffolded app with Xcode and runs an end-to-end hot-reload smoke
+# test in the iOS Simulator: launch -> app reports a live link -> ./ui apply ->
+# app confirms the new revision -> before/after screenshots (uploaded as artifacts).
+on:
+  workflow_dispatch:
+    inputs:
+      commit_screenshots:
+        description: "Commit the screenshots to docs/screenshots on this branch"
+        type: boolean
+        default: false
+  push:
+    paths:
+      - "templates/**"
+      - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/ios.yml"
+
+permissions:
+  contents: write   # only used by the opt-in "commit screenshots" step
+
+jobs:
+  unit:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests on the system python3 (oldest supported) and the runner python
+        run: |
+          /usr/bin/python3 --version
+          /usr/bin/python3 -m unittest discover -s tests -v
+          python3 -m unittest discover -s tests
+
+  build-and-smoke:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: |
+          XC="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          [ -n "$XC" ] && sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun simctl list runtimes | grep -i ios || true
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Scaffold Demo app
+        run: bash scripts/scaffold.sh Demo "$RUNNER_TEMP" com.example
+
+      - name: Validate design JSON
+        working-directory: ${{ runner.temp }}/Demo
+        run: ./ui validate
+
+      - name: Build (Debug, iOS Simulator)
+        working-directory: ${{ runner.temp }}/Demo
+        run: |
+          set -o pipefail
+          xcodebuild -project Demo.xcodeproj -scheme Demo -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath build \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES COMPILER_INDEX_STORE_ENABLE=NO \
+            build 2>&1 | tee build.log | grep -E "error:|warning: |BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" build.log
+
+      - name: Hot-reload smoke test
+        working-directory: ${{ runner.temp }}/Demo
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          t() { perl -e 'alarm shift @ARGV; exec @ARGV' "$@"; }   # per-command timeout (no coreutils on macOS)
+          UDID="$(xcrun simctl list devices available | grep -E '^\s+iPhone' | head -1 | grep -oE '[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}')"
+          echo "device $UDID"
+          mkdir -p .live && echo "$UDID" > .live/device
+          xcrun simctl boot "$UDID" || true
+          t 600 xcrun simctl bootstatus "$UDID" -b
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          # same clock/battery in every screenshot, so prototype and ejected shots compare cleanly
+          xcrun simctl status_bar "$UDID" override --time "9:41" --batteryState charged --batteryLevel 100 || true
+          xcrun simctl install "$UDID" build/Build/Products/Debug-iphonesimulator/Demo.app
+          SIMCTL_CHILD_UI_PROJECT_DIR="$PWD" xcrun simctl launch "$UDID" com.example.Demo -UIProjectDir "$PWD"
+          for i in $(seq 1 150); do [ -f .live/status.json ] && break; sleep 0.2; done
+          [ -f .live/status.json ] || { echo "app never wrote .live/status.json: not live (bundled design) or not launched"; exit 1; }
+          cat .live/status.json
+          BEFORE="$(cat design/*.json design/screens/*.json | shasum)"
+          ./ui status
+          sleep 4
+          t 60 xcrun simctl io "$UDID" screenshot .live/1-launch.png || echo "screenshot timed out"
+
+          # 1) token + text change: the app must confirm the new revision
+          ./ui apply --shot <<'OPS'
+          {"say": "CI smoke: brand color + title", "ops": [
+            {"op": "token", "path": "colors.brand", "value": "#E11D48"},
+            {"op": "set", "id": "home.hero.title", "props": {"text": "Hot reload works", "size": 28}},
+            {"op": "insert", "after": "home.hero.subtitle", "node": {"type": "text", "text": "Added live, no rebuild"}}
+          ]}
+          OPS
+          cp .live/shot.png .live/2-after-apply.png || true
+
+          # 2) invalid ops are rejected before they reach the app (exit 1)
+          if ./ui apply '{"op":"set","id":"nope","props":{"text":"x"}}'; then echo "invalid op was accepted"; exit 1; fi
+
+          # 3) undo restores the design byte-for-byte
+          ./ui undo
+          [ "$(cat design/*.json design/screens/*.json | shasum)" = "$BEFORE" ] || { echo "undo did not restore design/"; exit 1; }
+          sleep 1
+          t 60 xcrun simctl io "$UDID" screenshot .live/3-after-undo.png || echo "screenshot timed out"
+
+          # 4) other tabs, reached through hot reload alone (keep one tab -> the app selects it)
+          for tab in explore profile; do
+            ./ui apply "{\"op\":\"path\",\"file\":\"app\",\"path\":\"tabs\",\"value\":[{\"id\":\"$tab\",\"title\":\"$tab\",\"symbol\":\"circle\",\"screen\":\"$tab\"}]}"
+            sleep 3
+            t 60 xcrun simctl io "$UDID" screenshot ".live/4-$tab.png" || echo "screenshot timed out"
+            ./ui undo
+          done
+          [ "$(cat design/*.json design/screens/*.json | shasum)" = "$BEFORE" ] || { echo "undo did not restore design/"; exit 1; }
+
+          python3 - <<'PY'
+          import json, sys
+          s = json.load(open(".live/status.json"))
+          print(s)
+          assert s.get("source") in ("env", "defaults", "source"), "app is not live: %s" % s.get("source")
+          assert s.get("rev", 0) >= 6, "app did not confirm the revisions"
+          assert not s.get("error"), s.get("error")
+          PY
+          ./ui status
+          ./ui stats || true
+
+      - name: Eject to plain SwiftUI and build it
+        working-directory: ${{ runner.temp }}/Demo
+        run: |
+          set -o pipefail
+          ./ui eject --out "$RUNNER_TEMP/DemoSwiftUI"
+          cd "$RUNNER_TEMP/DemoSwiftUI"
+          find Sources -name '*.swift' | sort
+          xcodebuild -project Demo.xcodeproj -scheme Demo -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath build \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES COMPILER_INDEX_STORE_ENABLE=NO \
+            build 2>&1 | tee build.log | grep -E "error:|warning: |BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" build.log
+
+      - name: Run the ejected app and compare it with the prototype
+        working-directory: ${{ runner.temp }}/DemoSwiftUI
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          t() { perl -e 'alarm shift @ARGV; exec @ARGV' "$@"; }
+          LIVE="$RUNNER_TEMP/Demo/.live"
+          xcrun simctl install "$UDID" build/Build/Products/Debug-iphonesimulator/Demo.app
+          for tab in home explore profile; do
+            xcrun simctl launch --terminate-running-process "$UDID" com.example.Demo.swiftui -initialTab "$tab"
+            sleep 6
+            t 60 xcrun simctl io "$UDID" screenshot "$LIVE/5-ejected-$tab.png"
+          done
+          python3 - "$LIVE" <<'PY'
+          # Mean per-channel difference between prototype and ejected screenshots, ignoring
+          # the status bar and the tab bar (the prototype's tab shots use a one-tab bar).
+          import struct, subprocess, sys
+          live = sys.argv[1]
+
+          def pixels(path):
+              out = path + ".cmp.bmp"
+              subprocess.run(["sips", "-Z", "240", "-s", "format", "bmp", path, "--out", out],
+                             check=True, capture_output=True)
+              data = open(out, "rb").read()
+              off = struct.unpack_from("<I", data, 10)[0]
+              w, h = struct.unpack_from("<ii", data, 18)
+              step = struct.unpack_from("<H", data, 28)[0] // 8
+              row = (w * step + 3) & ~3
+              rows = []
+              for y in range(abs(h)):
+                  base = off + (abs(h) - 1 - y if h > 0 else y) * row
+                  rows.append(data[base:base + w * step])
+              return w, abs(h), step, rows
+
+          worst = 0.0
+          for tab, ref in (("home", "1-launch"), ("explore", "4-explore"), ("profile", "4-profile")):
+              wa, ha, sa, a = pixels(f"{live}/{ref}.png")
+              wb, hb, sb, b = pixels(f"{live}/5-ejected-{tab}.png")
+              if (wa, ha, sa) != (wb, hb, sb):
+                  print(f"{tab}: size differs {wa}x{ha} vs {wb}x{hb}")
+                  worst = 1.0
+                  continue
+              total = count = 0
+              for y in range(int(ha * 0.07), int(ha * 0.88)):
+                  ra, rb = a[y], b[y]
+                  for x in range(0, wa * sa, sa):
+                      for c in range(3):
+                          total += abs(ra[x + c] - rb[x + c])
+                      count += 3
+              d = total / (count * 255)
+              worst = max(worst, d)
+              print(f"{tab}: prototype vs ejected differ by {d:.2%}")
+          assert worst < 0.06, f"ejected app looks different from the prototype ({worst:.2%})"
+          PY
+
+      - name: Print small screenshots into the log (for remote review without artifact access)
+        if: always()
+        working-directory: ${{ runner.temp }}/Demo
+        run: |
+          for f in .live/*.png; do
+            [ -f "$f" ] || continue
+            sips -Z 560 -s format jpeg -s formatOptions 50 "$f" --out "${f%.png}.small.jpg" >/dev/null
+            echo "IMG_BEGIN $(basename "$f")"
+            base64 -i "${f%.png}.small.jpg" | fold -w 900
+            echo "IMG_END"
+          done
+
+      - name: Commit screenshots to docs/screenshots (manual runs only)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_screenshots }}
+        run: |
+          mkdir -p docs/screenshots
+          cp "$RUNNER_TEMP/Demo/.live/1-launch.png" docs/screenshots/home.png
+          cp "$RUNNER_TEMP/Demo/.live/2-after-apply.png" docs/screenshots/home-after-apply.png
+          cp "$RUNNER_TEMP/Demo/.live/4-explore.png" docs/screenshots/explore.png
+          cp "$RUNNER_TEMP/Demo/.live/4-profile.png" docs/screenshots/profile.png
+          for tab in home explore profile; do
+            cp "$RUNNER_TEMP/Demo/.live/5-ejected-$tab.png" "docs/screenshots/ejected-$tab.png" || true
+          done
+          for f in docs/screenshots/*.png; do sips -Z 900 "$f" >/dev/null; done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/screenshots
+          git commit -m "docs: Simulator screenshots from CI [skip ci]" || exit 0
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Upload screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-ui-smoke
+          path: |
+            ${{ runner.temp }}/Demo/.live/*.png
+            ${{ runner.temp }}/Demo/.live/status.json
+            ${{ runner.temp }}/Demo/build.log
+            ${{ runner.temp }}/DemoSwiftUI/build.log
+          if-no-files-found: warn
+          include-hidden-files: true   # screenshots live in .live/

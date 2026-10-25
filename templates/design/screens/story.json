@@ -1,0 +1,65 @@
+{
+  "id": "story",
+  "title": "Story",
+  "titleDisplay": "inline",
+  "background": "$background",
+  "body": {
+    "type": "scroll",
+    "id": "story.scroll",
+    "spacing": "$md",
+    "children": [
+      {
+        "type": "image",
+        "id": "story.image",
+        "url": "{{image}}",
+        "height": 260,
+        "maxWidth": "infinity"
+      },
+      {
+        "type": "vstack",
+        "id": "story.content",
+        "align": "leading",
+        "spacing": "$sm",
+        "padding": {
+          "horizontal": "$md"
+        },
+        "children": [
+          {
+            "type": "text",
+            "id": "story.title",
+            "text": "{{title}}",
+            "font": "$largeTitle",
+            "foreground": "$text"
+          },
+          {
+            "type": "label",
+            "id": "story.author",
+            "text": "{{author}}",
+            "symbol": "person.circle",
+            "style": "secondaryText"
+          },
+          {
+            "type": "text",
+            "id": "story.body",
+            "text": "Great interfaces feel inevitable. This placeholder story shows how a detail screen receives params from the list it was opened from.",
+            "font": "$body",
+            "foreground": "$text"
+          },
+          {
+            "type": "button",
+            "id": "story.save",
+            "text": "Save for later",
+            "symbol": "bookmark",
+            "action": {
+              "alert": {
+                "title": "Saved",
+                "message": "Added to your reading list."
+              }
+            },
+            "variant": "secondary"
+          }
+        ]
+      }
+    ]
+  }
+}

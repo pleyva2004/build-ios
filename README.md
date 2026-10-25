@@ -1,54 +1,79 @@
 # build-ios
 
-A Claude Code **skill** for building iOS (SwiftUI) apps entirely from the command line — no Xcode GUI required. Scaffold a new app, build it, run it on the Simulator, and capture a screenshot, all from the terminal (and drivable by Claude Code).
+A Claude Code **skill** for prototyping iOS (SwiftUI) app UIs from the command line, with no Xcode GUI.
 
-Built and verified on Apple Silicon with **Xcode 26.x / iOS 26.x**, and designed to stay portable to future versions.
+Scaffolded apps render their UI from JSON, and the app running in the Simulator hot-reloads
+it in about 0.2 seconds. A UI change is therefore one small, validated edit addressed by
+element id. There is no codebase to read and nothing to rebuild, so small, fast models
+(Claude Haiku) can make changes in about 3 s instead of minutes (measured in Claude Code).
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design.
+
+Built for Apple Silicon with **Xcode 26+ / iOS 26+**.
+
+The scaffolded demo app, captured by CI in the iOS 26 Simulator. The second shot is after one
+`./ui apply` (new title, brand color, inserted line), shown without a rebuild:
+
+<p>
+  <img src="docs/screenshots/home.png" width="200" alt="Home screen">
+  <img src="docs/screenshots/home-after-apply.png" width="200" alt="Home screen after a live ./ui apply">
+  <img src="docs/screenshots/explore.png" width="200" alt="Explore screen">
+  <img src="docs/screenshots/profile.png" width="200" alt="Profile screen">
+</p>
 
 ## Requirements
 - macOS on Apple Silicon
-- **Xcode** (full app, not just Command Line Tools) — install with [`xcodes`](https://github.com/XcodesOrg/xcodes): `brew install xcodes && xcodes install --latest`
-- Homebrew tools: `brew install xcodegen xcbeautify swiftlint swiftformat aria2 fastlane`
+- **Xcode** (the full app) — `brew install xcodes && xcodes install --latest`
+- `brew install xcodegen xcbeautify` (and `uv` for `./ui ask` outside Claude Code)
 - An iOS Simulator runtime: `xcodebuild -downloadPlatform iOS`
 
-Run `scripts/doctor.sh` to check all of the above and get the exact fix for anything missing.
+Run `scripts/doctor.sh` to check everything and get the exact fix for anything missing.
 
 ## Install as a Claude Code skill
-Clone into your personal skills directory:
 ```bash
 git clone <this-repo> ~/.claude/skills/build-ios
 ```
-Then invoke it with `/build-ios`, or just ask Claude to "build an iOS app".
+Then use `/build-ios`, or ask Claude to "prototype an iOS app".
 
-## Usage (standalone)
+## Usage
 ```bash
-# 1. Is this Mac ready?
-bash scripts/doctor.sh
+bash scripts/scaffold.sh MyApp ~/Code com.you    # new live-UI app
+cd ~/Code/MyApp && ./run.sh                      # build + launch once
 
-# 2. Create a new app
-bash scripts/scaffold.sh MyApp ~/Code com.you
+# from here on, UI changes hot-reload with no rebuild:
+./ui ask "make the main button a teal pill"      # one fast model call
+./ui ask -n 3 "make the home screen feel premium" && ./ui next
+./ui pick && ./ui tune                           # tap an element, nudge it with keys
+./ui undo
+./ui eval                                        # model accuracy + latency on 24 sample requests
+claude --model haiku                             # then: /ui add a settings screen
 
-# 3. Build + boot Simulator + install + launch + screenshot
-cd ~/Code/MyApp && ./run.sh
+# when the design is settled: plain SwiftUI, no JSON runtime
+./ui eject                                       # writes ../MyAppSwiftUI (re-run any time)
+cd ../MyAppSwiftUI && ./run.sh
 ```
 
 ## Layout
 ```
 build-ios/
-├── SKILL.md              # skill instructions + gotchas (read this)
+├── SKILL.md                 # skill instructions (the loop, which path, gotchas)
+├── docs/ARCHITECTURE.md     # why it's fast; latency budget
 ├── scripts/
-│   ├── doctor.sh         # environment readiness check
-│   └── scaffold.sh       # new-app generator (templates + XcodeGen)
-└── templates/
-    ├── project.yml       # XcodeGen project spec
-    ├── App.swift         # @main entry point
-    ├── ContentView.swift # starter UI (macro-free for reliable headless builds)
-    └── run.sh            # build → boot → install → launch → screenshot
+│   ├── doctor.sh            # environment readiness check
+│   └── scaffold.sh          # new-app generator
+├── templates/               # copied into every app
+│   ├── Runtime/*.swift      # live-UI engine: JSON → SwiftUI, hot reload, pick mode
+│   ├── Components/          # escape hatch: native SwiftUI views usable from JSON
+│   ├── design/              # starter UI: app.json, tokens.json, screens/*.json
+│   ├── ui                   # CLI: context / apply / undo / pick / ask / tune / stats / hook
+│   ├── tools/REFERENCE.md   # node + ops reference (what models read)
+│   ├── tools/eject.py       # design → standalone SwiftUI app (./ui eject)
+│   ├── CLAUDE.md, claude/   # per-app Claude Code rules, /ui skill, hooks
+│   ├── run.sh, project.yml  # lean build + launch; XcodeGen spec
+│   └── App.swift
+├── tests/test_ui.py         # engine tests + Swift/validator drift test
+├── tests/test_eject.py      # design → SwiftUI translation tests
+└── .github/workflows/ios.yml# compiles the template, Simulator hot-reload smoke test, builds + compares the ejected app
 ```
-
-## Design notes
-- Builds use the **generic iOS Simulator destination** so they resolve even right after a runtime install.
-- The template is intentionally **macro-free** (no `#Preview`) so `xcodebuild` never depends on the Swift macro plugin (`swift-plugin-server`), which can be flaky on a freshly installed Xcode. Add `#Preview { ContentView() }` back once your toolchain is warm.
-- ⚠️ Never `xcrun simctl runtime delete` a runtime image — duplicates can share one backing asset, and deleting forces an ~8.5 GB re-download.
 
 ## License
 MIT

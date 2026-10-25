@@ -1,0 +1,24 @@
+{"name": "pill teal cta (picked)", "select": "home.hero.cta", "request": "make this a teal pill", "expect": [{"id": "home.hero.cta", "prop": "radius", "eq": "$pill"}, {"id": "home.hero.cta", "prop": "tint", "in": ["teal", "#14B8A6", "#0D9488", "#008080"]}]}
+{"name": "brand color warmer", "request": "make the brand color warmer, like orange", "expect": [{"token": "colors.brand", "changed": true}, {"id": "home.hero.title", "unchanged": true}]}
+{"name": "one element blue not token", "select": "home.hero.title", "request": "make this text blue", "expect": [{"id": "home.hero.title", "prop": "foreground", "in": ["blue", "#0000FF", "#3B82F6", "#007AFF"]}, {"token": "colors.brand", "changed": false}]}
+{"name": "bigger title", "request": "make the 'Good morning' title bigger", "expect": [{"id": "home.hero.title", "size_gt": 22}]}
+{"name": "follow-up bigger again", "setup": [{"op": "nudge", "id": "home.hero.title", "prop": "size", "by": 1}], "history": "make the title bigger", "request": "a bit bigger again", "expect": [{"id": "home.hero.title", "size_gt": 24}]}
+{"name": "all cards more padding (style)", "request": "give all the cards more breathing room", "expect": [{"token": "styles.card.padding", "changed": true}]}
+{"name": "rename cta copy", "request": "change 'Start reading' to 'Read today's picks'", "expect": [{"id": "home.hero.cta", "prop": "text", "eq": "Read today's picks"}]}
+{"name": "subtitle under title", "request": "add a small grey line under 'Good morning' that says 'Tuesday, 5 picks'", "expect": [{"text_exists": "Tuesday, 5 picks", "screen": "home"}]}
+{"name": "avatar above name", "request": "on the profile screen, stack the avatar above the name instead of beside it", "expect": [{"id": "profile.avatar", "parent_type": "vstack"}]}
+{"name": "remove chevrons", "request": "remove the chevron arrows from the story rows", "expect": [{"id": "home.story.chevron", "exists": false}]}
+{"name": "edit one row via data", "request": "rename the second story to 'Field notes'", "expect": [{"data": "home:stories.1.title", "eq": "Field notes"}, {"data": "home:stories.0.title", "eq": "Design systems that scale"}]}
+{"name": "all rows via template", "request": "make every story title in the list use one line only", "expect": [{"id": "home.story.title", "prop": "lines", "eq": 1}]}
+{"name": "toolbar insert keeps compose", "request": "add a bell icon button to the home toolbar that opens an alert saying 'No new notifications'", "expect": [{"id": "home.compose", "exists": true}, {"toolbar_count": "home", "gte": 2}]}
+{"name": "new settings screen", "request": "add a settings screen with a dark mode toggle, opened from a gear in the profile toolbar", "expect": [{"screen_exists": "settings"}, {"toolbar_count": "profile", "gte": 1}]}
+{"name": "center title", "request": "center the 'Latest' heading", "expect": [{"id": "home.section", "prop": "frameAlign", "eq": "center"}]}
+{"name": "dark surface", "request": "in dark mode make the cards a bit lighter", "expect": [{"token": "colorsDark.surface", "changed": true}]}
+{"name": "grid three columns", "request": "show the explore topics in 3 columns", "expect": [{"id": "explore.grid", "prop": "columns", "eq": 3}]}
+{"name": "horizontal carousel", "request": "turn the explore grid into a horizontal scrolling row", "expect": [{"text_exists_any_type": "scroll", "screen": "explore"}]}
+{"name": "glass button", "select": "story.save", "request": "make this a liquid glass button", "expect": [{"id": "story.save", "prop": "variant", "in": ["glass", "glassProminent"]}]}
+{"name": "rounder tiles", "request": "make the explore tiles rounder", "expect": [{"id": "explore.tile", "prop": "radius", "changed": true}]}
+{"name": "hide email", "request": "hide the email address on the profile", "expect": [{"id": "profile.email", "hidden": true}]}
+{"name": "escalate map", "request": "add an interactive map of nearby bookstores", "expect": [{"escalate": true}]}
+{"name": "escalate swipe", "request": "let me swipe a story row left to delete it", "expect": [{"escalate": true}]}
+{"name": "tab rename", "request": "rename the Explore tab to Discover", "expect": [{"app": "tabs.1.title", "eq": "Discover"}]}

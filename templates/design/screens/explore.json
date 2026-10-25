@@ -1,0 +1,99 @@
+{
+  "id": "explore",
+  "title": "Explore",
+  "titleDisplay": "large",
+  "background": "$background",
+  "data": {
+    "topics": [
+      {
+        "name": "Design",
+        "symbol": "paintpalette",
+        "color": "#5B5BD6"
+      },
+      {
+        "name": "Motion",
+        "symbol": "wind",
+        "color": "#0EA5E9"
+      },
+      {
+        "name": "Color",
+        "symbol": "drop",
+        "color": "#F97316"
+      },
+      {
+        "name": "Type",
+        "symbol": "textformat",
+        "color": "#10B981"
+      },
+      {
+        "name": "Icons",
+        "symbol": "star",
+        "color": "#EC4899"
+      },
+      {
+        "name": "Layout",
+        "symbol": "square.grid.3x3",
+        "color": "#8B5CF6"
+      }
+    ]
+  },
+  "body": {
+    "type": "scroll",
+    "id": "explore.scroll",
+    "spacing": "$md",
+    "padding": "$md",
+    "children": [
+      {
+        "type": "textfield",
+        "id": "explore.search",
+        "placeholder": "Search topics",
+        "bind": "query"
+      },
+      {
+        "type": "grid",
+        "id": "explore.grid",
+        "columns": 2,
+        "spacing": "$md",
+        "children": [
+          {
+            "type": "repeat",
+            "id": "explore.topics",
+            "items": "data.topics",
+            "template": {
+              "type": "vstack",
+              "id": "explore.tile",
+              "align": "leading",
+              "spacing": "$sm",
+              "padding": "$md",
+              "height": 120,
+              "maxWidth": "infinity",
+              "frameAlign": "topLeading",
+              "background": "{{color}}",
+              "radius": "$lg",
+              "children": [
+                {
+                  "type": "image",
+                  "id": "explore.tile.icon",
+                  "symbol": "{{symbol}}",
+                  "size": 28,
+                  "foreground": "white"
+                },
+                {
+                  "type": "spacer",
+                  "id": "explore.tile.spacer"
+                },
+                {
+                  "type": "text",
+                  "id": "explore.tile.name",
+                  "text": "{{name}}",
+                  "font": "$headline",
+                  "foreground": "white"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,157 @@
+{
+  "id": "home",
+  "title": "Home",
+  "titleDisplay": "large",
+  "background": "$background",
+  "toolbar": [
+    {
+      "type": "button",
+      "id": "home.compose",
+      "symbol": "square.and.pencil",
+      "action": {
+        "sheet": "compose"
+      }
+    }
+  ],
+  "data": {
+    "stories": [
+      {
+        "title": "Design systems that scale",
+        "author": "Ada Park",
+        "minutes": "6",
+        "image": "https://picsum.photos/seed/scale/800/500"
+      },
+      {
+        "title": "The quiet power of motion",
+        "author": "Leo Grant",
+        "minutes": "4",
+        "image": "https://picsum.photos/seed/motion/800/500"
+      },
+      {
+        "title": "Color in dark mode",
+        "author": "Mia Chen",
+        "minutes": "8",
+        "image": "https://picsum.photos/seed/dark/800/500"
+      }
+    ]
+  },
+  "body": {
+    "type": "scroll",
+    "id": "home.scroll",
+    "spacing": "$md",
+    "padding": "$md",
+    "children": [
+      {
+        "type": "vstack",
+        "id": "home.hero",
+        "style": "card",
+        "align": "leading",
+        "spacing": "$sm",
+        "maxWidth": "infinity",
+        "frameAlign": "leading",
+        "children": [
+          {
+            "type": "text",
+            "id": "home.hero.title",
+            "text": "Good morning",
+            "font": "$title",
+            "foreground": "$text"
+          },
+          {
+            "type": "text",
+            "id": "home.hero.subtitle",
+            "text": "3 new stories picked for you",
+            "style": "secondaryText"
+          },
+          {
+            "type": "button",
+            "id": "home.hero.cta",
+            "text": "Start reading",
+            "symbol": "book",
+            "controlSize": "large",
+            "maxWidth": "infinity",
+            "action": {
+              "navigate": "story",
+              "params": {
+                "title": "Design systems that scale",
+                "author": "Ada Park",
+                "image": "https://picsum.photos/seed/scale/800/500"
+              }
+            },
+            "variant": "primary"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "id": "home.section",
+        "text": "Latest",
+        "font": "$headline",
+        "foreground": "$text",
+        "maxWidth": "infinity",
+        "frameAlign": "leading"
+      },
+      {
+        "type": "repeat",
+        "id": "home.stories",
+        "items": "data.stories",
+        "template": {
+          "type": "hstack",
+          "id": "home.story",
+          "style": "card",
+          "spacing": "$md",
+          "onTap": {
+            "navigate": "story",
+            "params": {
+              "title": "{{title}}",
+              "author": "{{author}}",
+              "image": "{{image}}"
+            }
+          },
+          "children": [
+            {
+              "type": "image",
+              "id": "home.story.image",
+              "url": "{{image}}",
+              "width": 72,
+              "height": 72,
+              "radius": "$md"
+            },
+            {
+              "type": "vstack",
+              "id": "home.story.text",
+              "align": "leading",
+              "spacing": "$xs",
+              "children": [
+                {
+                  "type": "text",
+                  "id": "home.story.title",
+                  "text": "{{title}}",
+                  "font": "$headline",
+                  "foreground": "$text",
+                  "lines": 2
+                },
+                {
+                  "type": "text",
+                  "id": "home.story.meta",
+                  "text": "{{author}} · {{minutes}} min",
+                  "style": "secondaryText"
+                }
+              ]
+            },
+            {
+              "type": "spacer",
+              "id": "home.story.spacer"
+            },
+            {
+              "type": "image",
+              "id": "home.story.chevron",
+              "symbol": "chevron.right",
+              "foreground": "$textSecondary"
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
