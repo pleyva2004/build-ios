@@ -57,7 +57,7 @@ The skill is built for a designer who only talks to Claude, with no commands or 
 ship [DESIGNER.md](templates/DESIGNER.md), a plain-language guide. Three things cut the rounds it takes
 to reach the design they imagine:
 - **Options for feelings:** "make it calmer", "feel like an achievement" or "show me ideas" returns 3
-  clearly different directions in one Claude turn (~5–6 s). Saying "next" or "option 2" flips between
+  visibly different directions in one Claude turn (~6–12 s). Saying "next" or "option 2" flips between
   them instantly.
 - **Instant words:** undo, redo, next, previous, option N, keep and select are answered in ~0.4 s by the
   prompt hook, with no model call.

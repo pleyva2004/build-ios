@@ -151,7 +151,8 @@ between what they imagine and what appears, so the loop is shaped around how a d
 Measured with a scripted 15-prompt designer session in headless Claude Code against the firstApp
 prototype (one open chat, stand-in app):
 - 9 of 15 prompts were instant (0.27–0.55 s).
-- Options turns took 5–6.5 s and single changes 4–6 s.
+- Single changes took 4–6 s. Options turns took 6–12 s once each option had to use a different lever
+  (color, type, space or layout). Simulator renders had shown three rewordings that looked alike.
 - The whole session cost $0.012 on Haiku and $0.22 on Sonnet, at about the same speed.
 - The first run exposed five fixes, applied above: the feeling hint, instant replies when no options
   are on screen, thinking off, full copy in the context, and the brief winning over the cookbook.
@@ -164,7 +165,7 @@ the CLI startup of a fresh `claude -p` process (~2–3 s) is not included in the
 |---|---|---|---|---|
 | `./ui tune` key (no model) | — | ~30 ms | ≤150 ms | **~0.2 s** |
 | instant word in chat (next, keep, undo…) | — | hook | ≤150 ms | **0.3–0.5 s measured** |
-| feeling prompt → 3 options (Haiku, open chat) | ~5 s | ~30 ms | ≤150 ms | **5–9.6 s measured** |
+| feeling prompt → 3 options (open chat, Haiku or Sonnet) | ~6–12 s | ~30 ms | ≤150 ms | **6–12 s measured** |
 | `./ui apply` (ops given) | — | ~30 ms | ≤150 ms | **~0.2 s** (0.25 s + 0.22 s in CI) |
 | `/ui` in Claude Code (Haiku) | ~2 s | ~30 ms | ≤150 ms | **3.0 s measured** (2 turns, ~$0.004) |
 | plain prompt, `claude --model haiku` session | ~2.5 s | ~30 ms | ≤150 ms | **3.2 s measured** |
