@@ -102,9 +102,9 @@ final class LiveStore: ObservableObject {
     // MARK: locating the design folder
 
     /// Order: $UI_PROJECT_DIR (run.sh passes SIMCTL_CHILD_UI_PROJECT_DIR), then the
-    /// UIProjectDir default (run.sh sets it as a launch argument and persistently, so
-    /// relaunching from the home screen stays live), then the folder this file was
-    /// compiled from (Debug), then the copy bundled into the app (not live).
+    /// UIProjectDir default (run.sh passes `-UIProjectDir <path>` as a launch
+    /// argument), then the folder this file was compiled from (Debug builds; keeps a
+    /// home-screen relaunch live), then the copy bundled into the app (not live).
     static func locateDesign() -> (project: URL?, design: URL, source: String) {
         let fm = FileManager.default
         var candidates: [(String, String)] = []

@@ -282,7 +282,7 @@ final class LiveSpec {
             throw e
         } catch {
             let ns = error as NSError
-            let detail = (ns.userInfo[NSDebugDescriptionKey] as? String) ?? ns.localizedDescription
+            let detail = (ns.userInfo[NSDebugDescriptionErrorKey] as? String) ?? ns.localizedDescription
             throw LiveError(message: "\(url.lastPathComponent): \(detail)")
         }
     }
